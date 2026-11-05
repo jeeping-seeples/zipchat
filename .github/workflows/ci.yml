@@ -1,0 +1,77 @@
+
+name: ZipChat ARM64 CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zipchat-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-arm64:
+    name: Linux ARM64 Build & Tests
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libasound2-dev \
+            libgl1-mesa-dev \
+            libegl1-mesa-dev
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Verify ARM64
+        run: |
+          uname -m
+          test "$(uname -m)" = "aarch64"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build release
+        run: cargo build --locked --release
+
+      - name: Verify binary
+        run: |
+          file target/release/zipchat
+          readelf -h target/release/zipchat | grep Machine
+
+      - name: Upload ARM64 executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: zipchat-linux-arm64
+          path: target/release/zipchat
+          retention-days: 14
