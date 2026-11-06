@@ -1,12 +1,12 @@
-# Gateway integration rules
+# Gateway Integration (Provider Preset)
 
-The gateway contract is not yet frozen.
+Following ZipChat's pivot to a standalone AI chat application (ZD-010), `universal-ai-gateway` is supported as an optional provider preset rather than a mandatory client-server dependency.
 
-Before implementing:
-1. Obtain the approved API contract from `universal-ai-gateway`.
-2. Confirm base URL and authentication behavior.
-3. Confirm model identifier format.
-4. Confirm error schema and timeout expectations.
-5. Confirm streaming protocol and cancellation behavior.
+## Preset Configuration
 
-Do not assume that OpenAI-compatible means every OpenAI endpoint or field is supported. Implement only the documented subset and test against the gateway.
+- **Provider Name:** Universal AI Gateway
+- **Base URL:** `http://127.0.0.1:9471/v1`
+- **Authentication:** Optional (empty key by default for localhost)
+- **Endpoints:**
+  - `GET http://127.0.0.1:9471/v1/models`
+  - `POST http://127.0.0.1:9471/v1/chat/completions`

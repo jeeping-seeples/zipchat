@@ -1,27 +1,148 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::models::Conversation;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+use crate::models::{Conversation, Provider};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppSettingsData {
-    pub gateway_url: String,
-    pub selected_model: Option<String>,
+    #[serde(default = "default_version")]
+    pub version: u32,
+    pub default_provider_id: Option<String>,
+    pub default_model: Option<String>,
+    #[serde(default = "default_true")]
     pub stream_enabled: bool,
+    #[serde(default = "default_true")]
     pub auto_scroll_enabled: bool,
+    #[serde(default)]
+    pub pinned_models: Vec<String>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub providers: Vec<Provider>,
+
+    // Legacy fields for v1 migration
+    #[serde(skip_serializing, default)]
+    pub gateway_url: Option<String>,
+    #[serde(skip_serializing, default)]
+    pub selected_model: Option<String>,
+}
+
+fn default_version() -> u32 {
+    2
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AppSettingsData {
     fn default() -> Self {
         Self {
-            gateway_url: "http://127.0.0.1:9471".to_string(),
-            selected_model: None,
-            stream_enabled: false,
+            version: 2,
+            default_provider_id: Some("openai".to_string()),
+            default_model: Some("gpt-4o".to_string()),
+            stream_enabled: true,
             auto_scroll_enabled: true,
+            pinned_models: Vec::new(),
+            system_prompt: None,
+            temperature: Some(0.7),
+            max_tokens: None,
+            providers: Self::default_presets(),
+            gateway_url: None,
+            selected_model: None,
         }
+    }
+}
+
+impl AppSettingsData {
+    pub fn default_presets() -> Vec<Provider> {
+        let mut openrouter =
+            Provider::new("openrouter", "OpenRouter", "https://openrouter.ai/api/v1");
+        openrouter.headers.insert(
+            "HTTP-Referer".to_string(),
+            "https://github.com/jeeping-seeples/zipchat".to_string(),
+        );
+        openrouter
+            .headers
+            .insert("X-Title".to_string(), "ZipChat".to_string());
+
+        vec![
+            Provider::new("openai", "OpenAI", "https://api.openai.com/v1"),
+            openrouter,
+            Provider::new("groq", "Groq", "https://api.groq.com/openai/v1"),
+            Provider::new("cerebras", "Cerebras", "https://api.cerebras.ai/v1"),
+            Provider::new("together", "Together AI", "https://api.together.xyz/v1"),
+            Provider::new("mistral", "Mistral", "https://api.mistral.ai/v1"),
+            Provider::new("deepseek", "DeepSeek", "https://api.deepseek.com/v1"),
+            Provider::new(
+                "gemini",
+                "Gemini (OpenAI Endpoint)",
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+            ),
+            Provider::new("ollama", "Ollama (Local)", "http://localhost:11434/v1"),
+            Provider::new("lmstudio", "LM Studio (Local)", "http://localhost:1234/v1"),
+            Provider::new(
+                "gateway",
+                "Universal AI Gateway",
+                "http://127.0.0.1:9471/v1",
+            ),
+        ]
+    }
+
+    pub fn migrate_if_needed(&mut self) -> bool {
+        let mut changed = false;
+
+        if self.version < 2 || self.gateway_url.is_some() {
+            let legacy_url = self
+                .gateway_url
+                .take()
+                .unwrap_or_else(|| "http://127.0.0.1:9471".to_string());
+            let legacy_model = self.selected_model.take();
+
+            if self.providers.is_empty() {
+                self.providers = Self::default_presets();
+            }
+
+            let formatted_base = format!("{}/v1", legacy_url.trim_end_matches('/'));
+            if let Some(gw) = self.providers.iter_mut().find(|p| p.id == "gateway") {
+                gw.base_url = formatted_base;
+                gw.enabled = true;
+            } else {
+                self.providers.push(Provider::new(
+                    "gateway",
+                    "Universal AI Gateway",
+                    formatted_base,
+                ));
+            }
+
+            if self.default_provider_id.is_none() {
+                self.default_provider_id = Some("gateway".to_string());
+            }
+            if self.default_model.is_none() {
+                self.default_model = legacy_model;
+            }
+
+            self.version = 2;
+            changed = true;
+        }
+
+        if self.providers.is_empty() {
+            self.providers = Self::default_presets();
+            changed = true;
+        }
+
+        changed
     }
 }
 
@@ -31,18 +152,12 @@ pub struct StorageManager {
 }
 
 impl StorageManager {
-    /// Create a storage manager with an explicit path or detect platform defaults
     pub fn new(custom_dir: Option<PathBuf>) -> Self {
         let data_dir = custom_dir.unwrap_or_else(Self::detect_data_dir);
         let _ = fs::create_dir_all(&data_dir);
         Self { data_dir }
     }
 
-    /// Detect platform default configuration and data directory:
-    /// - Linux/Raspberry Pi ARM64: $XDG_CONFIG_HOME/zipchat or ~/.config/zipchat
-    /// - macOS: ~/Library/Application Support/zipchat
-    /// - Windows: %APPDATA%\zipchat
-    /// - Fallback: ./.zipchat
     pub fn detect_data_dir() -> PathBuf {
         #[cfg(target_os = "windows")]
         {
@@ -94,8 +209,16 @@ impl StorageManager {
         self.data_dir.join("conversations.json")
     }
 
-    /// Safely atomic write to destination file by writing to a temporary file in the same directory first
-    pub fn atomic_write(&self, path: &Path, content: &[u8]) -> io::Result<()> {
+    pub fn secrets_path(&self) -> PathBuf {
+        self.data_dir.join("secrets.json")
+    }
+
+    pub fn atomic_write(
+        &self,
+        path: &Path,
+        content: &[u8],
+        permissions_0600: bool,
+    ) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -108,7 +231,15 @@ impl StorageManager {
         let tmp_path = path.with_file_name(tmp_file_name);
 
         {
-            let mut file = File::create(&tmp_path)?;
+            let mut options = OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+
+            #[cfg(unix)]
+            if permissions_0600 {
+                options.mode(0o600);
+            }
+
+            let mut file = options.open(&tmp_path)?;
             file.write_all(content)?;
             file.flush()?;
             file.sync_all()?;
@@ -118,32 +249,44 @@ impl StorageManager {
         Ok(())
     }
 
-    /// Load settings from settings.json or return default
     pub fn load_settings(&self) -> AppSettingsData {
         let path = self.settings_path();
         if path.exists() {
             if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(settings) = serde_json::from_str::<AppSettingsData>(&content) {
+                if let Ok(mut settings) = serde_json::from_str::<AppSettingsData>(&content) {
+                    if settings.migrate_if_needed() {
+                        let _ = self.save_settings(&settings);
+                    }
                     return settings;
                 }
             }
         }
-        AppSettingsData::default()
+        let settings = AppSettingsData::default();
+        let _ = self.save_settings(&settings);
+        settings
     }
 
-    /// Save settings atomically to settings.json
     pub fn save_settings(&self, settings: &AppSettingsData) -> io::Result<()> {
         let json_bytes = serde_json::to_vec_pretty(settings)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        self.atomic_write(&self.settings_path(), &json_bytes)
+        self.atomic_write(&self.settings_path(), &json_bytes, false)
     }
 
-    /// Load conversations from conversations.json or return empty
     pub fn load_conversations(&self) -> Vec<Conversation> {
         let path = self.conversations_path();
         if path.exists() {
             if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(convs) = serde_json::from_str::<Vec<Conversation>>(&content) {
+                if let Ok(mut convs) = serde_json::from_str::<Vec<Conversation>>(&content) {
+                    let mut modified = false;
+                    for conv in &mut convs {
+                        if conv.provider_id.is_none() {
+                            conv.provider_id = Some("gateway".to_string());
+                            modified = true;
+                        }
+                    }
+                    if modified {
+                        let _ = self.save_conversations(&convs);
+                    }
                     return convs;
                 }
             }
@@ -151,17 +294,36 @@ impl StorageManager {
         Vec::new()
     }
 
-    /// Save conversations atomically to conversations.json
     pub fn save_conversations(&self, conversations: &[Conversation]) -> io::Result<()> {
         let json_bytes = serde_json::to_vec_pretty(conversations)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        self.atomic_write(&self.conversations_path(), &json_bytes)
+        self.atomic_write(&self.conversations_path(), &json_bytes, false)
     }
 
-    /// Export a conversation to clean Markdown string
+    pub fn load_secrets(&self) -> HashMap<String, String> {
+        let path = self.secrets_path();
+        if path.exists() {
+            if let Ok(content) = fs::read_to_string(&path) {
+                if let Ok(secrets) = serde_json::from_str::<HashMap<String, String>>(&content) {
+                    return secrets;
+                }
+            }
+        }
+        HashMap::new()
+    }
+
+    pub fn save_secrets(&self, secrets: &HashMap<String, String>) -> io::Result<()> {
+        let json_bytes = serde_json::to_vec_pretty(secrets)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.atomic_write(&self.secrets_path(), &json_bytes, true)
+    }
+
     pub fn export_to_markdown(conv: &Conversation) -> String {
         let mut md = String::new();
         md.push_str(&format!("# {}\n\n", conv.title));
+        if let Some(provider) = &conv.provider_id {
+            md.push_str(&format!("*Provider:* {}\n", provider));
+        }
         if let Some(model) = &conv.model {
             md.push_str(&format!("*Model:* {}\n", model));
         }
@@ -185,7 +347,6 @@ impl StorageManager {
         md
     }
 
-    /// Export a conversation to formatted JSON string
     pub fn export_to_json(conv: &Conversation) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(conv)
     }

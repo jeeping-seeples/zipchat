@@ -1,25 +1,58 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-/// Response from GET /health
+/// Provider descriptor configured in settings
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct HealthResponse {
-    pub status: String,
-    pub version: String,
+pub struct Provider {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub models_fetched_at: Option<u64>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
-/// Model descriptor in GET /v1/models response
+impl Provider {
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            base_url: base_url.into(),
+            enabled: true,
+            models: Vec::new(),
+            models_fetched_at: None,
+            headers: HashMap::new(),
+        }
+    }
+}
+
+/// Model descriptor in GET {base}/models response
+/// Tolerant parsing: only `id` is required
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelCard {
     pub id: String,
-    pub object: String,
-    pub created: u64,
-    pub owned_by: String,
+    #[serde(default)]
+    pub object: Option<String>,
+    #[serde(default)]
+    pub created: Option<u64>,
+    #[serde(default)]
+    pub owned_by: Option<String>,
 }
 
-/// Response from GET /v1/models
+/// Response from GET {base}/models
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelListResponse {
-    pub object: String,
+    #[serde(default)]
+    pub object: Option<String>,
+    #[serde(default)]
     pub data: Vec<ModelCard>,
 }
 
@@ -58,7 +91,7 @@ impl ChatMessage {
     }
 }
 
-/// Request payload for POST /v1/chat/completions
+/// Request payload for POST {base}/chat/completions
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -78,22 +111,31 @@ pub struct ChatChoice {
     pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct Usage {
+    #[serde(default)]
     pub prompt_tokens: u32,
+    #[serde(default)]
     pub completion_tokens: u32,
+    #[serde(default)]
     pub total_tokens: u32,
 }
 
-/// Response payload from POST /v1/chat/completions (non-streaming)
+/// Response payload from POST {base}/chat/completions (non-streaming)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatCompletionResponse {
-    pub id: String,
-    pub object: String,
-    pub created: u64,
-    pub model: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub object: Option<String>,
+    #[serde(default)]
+    pub created: Option<u64>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
     pub choices: Vec<ChatChoice>,
-    pub usage: Usage,
+    #[serde(default)]
+    pub usage: Option<Usage>,
 }
 
 /// Chunk delta for streaming chat completions
@@ -114,30 +156,36 @@ pub struct ChunkChoice {
     pub finish_reason: Option<String>,
 }
 
-/// Streaming chunk event payload from POST /v1/chat/completions (stream: true)
+/// Streaming chunk event payload from POST {base}/chat/completions (stream: true)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatCompletionChunk {
-    pub id: String,
-    pub object: String,
-    pub created: u64,
-    pub model: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub object: Option<String>,
+    #[serde(default)]
+    pub created: Option<u64>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
     pub choices: Vec<ChunkChoice>,
 }
 
-/// Gateway error details
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GatewayErrorDetail {
+/// Structured error details
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ApiErrorDetail {
+    #[serde(default)]
     pub message: String,
-    #[serde(rename = "type")]
-    pub error_type: String,
+    #[serde(rename = "type", default)]
+    pub error_type: Option<String>,
     pub param: Option<String>,
     pub code: Option<String>,
 }
 
-/// Gateway structured error response wrapper
+/// Structured error response wrapper
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GatewayErrorResponse {
-    pub error: GatewayErrorDetail,
+pub struct ApiErrorResponse {
+    pub error: ApiErrorDetail,
 }
 
 /// Delivery status of a message in UI
@@ -158,20 +206,35 @@ pub struct LocalMessage {
     pub content: String,
     pub status: MessageStatus,
     pub timestamp_epoch_secs: u64,
+    #[serde(default)]
+    pub usage: Option<Usage>,
 }
 
 /// A conversation session containing message history
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Conversation {
     pub id: String,
     pub title: String,
+    #[serde(default)]
+    pub provider_id: Option<String>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
     pub messages: Vec<LocalMessage>,
     pub created_at_epoch_secs: u64,
 }
 
 impl Conversation {
-    pub fn new(id: impl Into<String>, title: impl Into<String>, model: Option<String>) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        provider_id: Option<String>,
+        model: Option<String>,
+    ) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -179,7 +242,11 @@ impl Conversation {
         Self {
             id: id.into(),
             title: title.into(),
+            provider_id,
             model,
+            system_prompt: None,
+            temperature: None,
+            max_tokens: None,
             messages: Vec::new(),
             created_at_epoch_secs: now,
         }

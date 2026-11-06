@@ -1,19 +1,27 @@
 use futures_util::StreamExt;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, StatusCode};
+use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 
 use crate::models::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, GatewayErrorResponse,
-    HealthResponse, ModelListResponse,
+    ApiErrorResponse, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
+    ModelListResponse,
 };
 
 #[derive(Debug)]
 pub enum ClientError {
     InvalidUrl(String),
     Network(reqwest::Error),
-    Gateway {
+    AuthError(String),
+    NotFound(String),
+    RateLimit {
+        retry_after: Option<String>,
+        message: String,
+    },
+    ProviderError {
         status: StatusCode,
         error_type: String,
         message: String,
@@ -26,13 +34,38 @@ impl std::error::Error for ClientError {}
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ClientError::InvalidUrl(msg) => write!(f, "Invalid gateway URL: {}", msg),
-            ClientError::Network(err) => write!(f, "Network error: {}", err),
-            ClientError::Gateway {
+            ClientError::InvalidUrl(msg) => write!(f, "Invalid base URL: {}", msg),
+            ClientError::Network(err) => {
+                if err.is_timeout() {
+                    write!(f, "Request timed out")
+                } else if err.is_connect() {
+                    write!(f, "Connection failed or refused")
+                } else {
+                    write!(f, "Network error: {}", err)
+                }
+            }
+            ClientError::AuthError(msg) => write!(f, "Authentication failed (401/403): {}", msg),
+            ClientError::NotFound(msg) => {
+                write!(f, "Not found (404 - check base URL or model): {}", msg)
+            }
+            ClientError::RateLimit {
+                message,
+                retry_after,
+            } => {
+                if let Some(ra) = retry_after {
+                    write!(f, "Rate limit exceeded (retry after {}s): {}", ra, message)
+                } else {
+                    write!(f, "Rate limit exceeded (429): {}", message)
+                }
+            }
+            ClientError::ProviderError {
                 status,
                 error_type,
                 message,
-            } => write!(f, "Gateway error ({status}, type: {error_type}): {message}"),
+            } => write!(
+                f,
+                "Provider error ({status}, type: {error_type}): {message}"
+            ),
             ClientError::Decoding(msg) => write!(f, "Response decoding error: {}", msg),
         }
     }
@@ -44,7 +77,6 @@ impl From<reqwest::Error> for ClientError {
     }
 }
 
-/// Events emitted during streaming chat completions
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
     Delta(String),
@@ -52,16 +84,30 @@ pub enum StreamEvent {
     Done,
 }
 
-#[derive(Clone, Debug)]
-pub struct GatewayClient {
+#[derive(Clone)]
+pub struct ApiClient {
     base_url: String,
+    api_key: Option<String>,
+    extra_headers: HashMap<String, String>,
     http: Client,
 }
 
-impl GatewayClient {
-    pub const DEFAULT_BASE_URL: &'static str = "http://127.0.0.1:9471";
+impl fmt::Debug for ApiClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApiClient")
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("extra_headers", &self.extra_headers)
+            .finish()
+    }
+}
 
-    pub fn new(base_url: impl Into<String>) -> Result<Self, ClientError> {
+impl ApiClient {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: Option<String>,
+        extra_headers: HashMap<String, String>,
+    ) -> Result<Self, ClientError> {
         let base_url = base_url.into();
         let trimmed = base_url.trim().trim_end_matches('/');
         if trimmed.is_empty()
@@ -77,8 +123,19 @@ impl GatewayClient {
             .build()
             .map_err(ClientError::Network)?;
 
+        let key = api_key.and_then(|k| {
+            let t = k.trim().to_string();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        });
+
         Ok(Self {
             base_url: trimmed.to_string(),
+            api_key: key,
+            extra_headers,
             http,
         })
     }
@@ -87,22 +144,27 @@ impl GatewayClient {
         &self.base_url
     }
 
-    pub async fn check_health(&self) -> Result<HealthResponse, ClientError> {
-        let url = format!("{}/health", self.base_url);
-        let resp = self.http.get(&url).send().await?;
-
-        if !resp.status().is_success() {
-            return Err(Self::extract_error(resp).await);
+    fn apply_headers(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(key) = &self.api_key {
+            builder = builder.header("Authorization", format!("Bearer {}", key));
         }
 
-        resp.json::<HealthResponse>()
-            .await
-            .map_err(|e| ClientError::Decoding(e.to_string()))
+        let mut headers = HeaderMap::new();
+        for (k, v) in &self.extra_headers {
+            if let (Ok(name), Ok(val)) = (
+                HeaderName::from_bytes(k.as_bytes()),
+                HeaderValue::from_str(v),
+            ) {
+                headers.insert(name, val);
+            }
+        }
+        builder.headers(headers)
     }
 
     pub async fn list_models(&self) -> Result<ModelListResponse, ClientError> {
-        let url = format!("{}/v1/models", self.base_url);
-        let resp = self.http.get(&url).send().await?;
+        let url = format!("{}/models", self.base_url);
+        let req = self.apply_headers(self.http.get(&url));
+        let resp = req.send().await?;
 
         if !resp.status().is_success() {
             return Err(Self::extract_error(resp).await);
@@ -117,8 +179,9 @@ impl GatewayClient {
         &self,
         request: &ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, ClientError> {
-        let url = format!("{}/v1/chat/completions", self.base_url);
-        let resp = self.http.post(&url).json(request).send().await?;
+        let url = format!("{}/chat/completions", self.base_url);
+        let req = self.apply_headers(self.http.post(&url)).json(request);
+        let resp = req.send().await?;
 
         if !resp.status().is_success() {
             return Err(Self::extract_error(resp).await);
@@ -134,8 +197,9 @@ impl GatewayClient {
         request: &ChatCompletionRequest,
         event_tx: Sender<StreamEvent>,
     ) -> Result<(), ClientError> {
-        let url = format!("{}/v1/chat/completions", self.base_url);
-        let resp = self.http.post(&url).json(request).send().await?;
+        let url = format!("{}/chat/completions", self.base_url);
+        let req = self.apply_headers(self.http.post(&url)).json(request);
+        let resp = req.send().await?;
 
         if !resp.status().is_success() {
             return Err(Self::extract_error(resp).await);
@@ -172,14 +236,14 @@ impl GatewayClient {
             buffer.push_str(&chunk_str);
 
             while let Some(pos) = buffer.find('\n') {
-                let line = buffer[..pos].trim_end_matches("\r").to_string();
+                let line = buffer[..pos].trim_end_matches('\r').to_string();
                 buffer.drain(..=pos);
 
                 Self::process_sse_line(&line, &event_tx).await;
             }
         }
 
-        let trimmed_rem = buffer.trim_end_matches("\r").to_string();
+        let trimmed_rem = buffer.trim_end_matches('\r').to_string();
         if !trimmed_rem.is_empty() {
             Self::process_sse_line(&trimmed_rem, &event_tx).await;
         }
@@ -220,16 +284,35 @@ impl GatewayClient {
 
     async fn extract_error(response: reqwest::Response) -> ClientError {
         let status = response.status();
-        match response.json::<GatewayErrorResponse>().await {
-            Ok(err_body) => ClientError::Gateway {
-                status,
-                error_type: err_body.error.error_type,
-                message: err_body.error.message,
+        let headers = response.headers().clone();
+        let retry_after = headers
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let (error_type, message) = match response.json::<ApiErrorResponse>().await {
+            Ok(body) => (
+                body.error.error_type.unwrap_or_else(|| "error".to_string()),
+                if body.error.message.is_empty() {
+                    format!("HTTP status {}", status)
+                } else {
+                    body.error.message
+                },
+            ),
+            Err(_) => ("unknown".to_string(), format!("HTTP error {}", status)),
+        };
+
+        match status {
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ClientError::AuthError(message),
+            StatusCode::NOT_FOUND => ClientError::NotFound(message),
+            StatusCode::TOO_MANY_REQUESTS => ClientError::RateLimit {
+                retry_after,
+                message,
             },
-            Err(_) => ClientError::Gateway {
+            _ => ClientError::ProviderError {
                 status,
-                error_type: "unknown".to_string(),
-                message: format!("HTTP error {}", status),
+                error_type,
+                message,
             },
         }
     }

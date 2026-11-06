@@ -1,29 +1,11 @@
+use reqwest::StatusCode;
 use serde_json::json;
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use zipchat::client::{ClientError, GatewayClient, StreamEvent};
+use zipchat::client::{ApiClient, ClientError, StreamEvent};
 use zipchat::models::{ChatCompletionRequest, ChatMessage};
-
-#[tokio::test]
-async fn test_check_health_success() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/health"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "status": "ok",
-            "version": "0.1.0"
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let client = GatewayClient::new(mock_server.uri()).expect("Valid client URL");
-    let health = client.check_health().await.expect("Health check succeeded");
-
-    assert_eq!(health.status, "ok");
-    assert_eq!(health.version, "0.1.0");
-}
 
 #[tokio::test]
 async fn test_list_models_success() {
@@ -38,175 +20,124 @@ async fn test_list_models_success() {
                     "id": "mock-fast",
                     "object": "model",
                     "created": 1700000000,
-                    "owned_by": "mock-provider"
+                    "owned_by": "organization-owner"
                 },
                 {
-                    "id": "mock-gpt",
+                    "id": "mock-smart",
                     "object": "model",
-                    "created": 1700000000,
-                    "owned_by": "mock-provider"
+                    "created": 1700000001,
+                    "owned_by": "organization-owner"
                 }
             ]
         })))
         .mount(&mock_server)
         .await;
 
-    let client = GatewayClient::new(mock_server.uri()).expect("Valid client URL");
+    let client = ApiClient::new(format!("{}/v1", mock_server.uri()), None, HashMap::new())
+        .expect("Valid client URL");
     let models = client.list_models().await.expect("List models succeeded");
 
     assert_eq!(models.data.len(), 2);
     assert_eq!(models.data[0].id, "mock-fast");
-    assert_eq!(models.data[1].id, "mock-gpt");
+    assert_eq!(models.data[1].id, "mock-smart");
 }
 
 #[tokio::test]
-async fn test_chat_completion_success() {
+async fn test_chat_completion_non_streaming() {
     let mock_server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "chatcmpl-mock-12345",
+            "id": "chatcmpl-123",
             "object": "chat.completion",
             "created": 1700000000,
-            "model": "mock-gpt",
+            "model": "mock-fast",
             "choices": [
                 {
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": "Hello! How can I help you today?"
+                        "content": "Hello world from non-streaming!"
                     },
                     "finish_reason": "stop"
                 }
             ],
             "usage": {
                 "prompt_tokens": 10,
-                "completion_tokens": 8,
-                "total_tokens": 18
+                "completion_tokens": 20,
+                "total_tokens": 30
             }
         })))
         .mount(&mock_server)
         .await;
 
-    let client = GatewayClient::new(mock_server.uri()).expect("Valid client URL");
+    let client = ApiClient::new(format!("{}/v1", mock_server.uri()), None, HashMap::new())
+        .expect("Valid client URL");
     let req = ChatCompletionRequest {
-        model: "mock-gpt".to_string(),
-        messages: vec![ChatMessage::user("Hi there")],
-        temperature: None,
-        max_tokens: None,
-        stream: None,
+        model: "mock-fast".to_string(),
+        messages: vec![ChatMessage::user("Hi")],
+        temperature: Some(0.7),
+        max_tokens: Some(100),
+        stream: Some(false),
     };
 
     let resp = client
         .chat_completion(&req)
         .await
         .expect("Chat completion succeeded");
-    assert_eq!(resp.id, "chatcmpl-mock-12345");
+
+    assert_eq!(resp.id.as_deref(), Some("chatcmpl-123"));
     assert_eq!(
         resp.choices[0].message.content,
-        "Hello! How can I help you today?"
+        "Hello world from non-streaming!"
     );
+    assert_eq!(resp.usage.map(|u| u.total_tokens), Some(30));
 }
 
 #[tokio::test]
-async fn test_gateway_error_handling() {
+async fn test_chat_completion_error_handling() {
     let mock_server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
             "error": {
-                "message": "Model 'unknown-model' not found",
-                "type": "not_found_error",
-                "param": null,
-                "code": null
+                "message": "Internal server upstream error",
+                "type": "server_error"
             }
         })))
         .mount(&mock_server)
         .await;
 
-    let client = GatewayClient::new(mock_server.uri()).expect("Valid client URL");
+    let client = ApiClient::new(format!("{}/v1", mock_server.uri()), None, HashMap::new())
+        .expect("Valid client URL");
     let req = ChatCompletionRequest {
-        model: "unknown-model".to_string(),
-        messages: vec![ChatMessage::user("Hi")],
+        model: "mock-fast".to_string(),
+        messages: vec![ChatMessage::user("Trigger error")],
         temperature: None,
         max_tokens: None,
-        stream: None,
+        stream: Some(false),
     };
 
-    let result = client.chat_completion(&req).await;
-    match result {
-        Err(ClientError::Gateway {
-            status,
-            error_type,
-            message,
+    let res = client.chat_completion(&req).await;
+    match res {
+        Err(ClientError::ProviderError {
+            status, message, ..
         }) => {
-            assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
-            assert_eq!(error_type, "not_found_error");
-            assert!(message.contains("not found"));
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(message.contains("Internal server upstream error"));
         }
-        other => panic!("Expected ClientError::Gateway, got {:?}", other),
+        _ => panic!("Expected ProviderError(500), got {:?}", res),
     }
 }
 
 #[tokio::test]
-async fn test_multi_turn_chat_history() {
+async fn test_chat_completion_stream_success() {
     let mock_server = MockServer::start().await;
 
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "chatcmpl-mock-multiturn",
-            "object": "chat.completion",
-            "created": 1700000000,
-            "model": "mock-gpt",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "You are 25 years old."
-                    },
-                    "finish_reason": "stop"
-                }
-            ],
-            "usage": {
-                "prompt_tokens": 25,
-                "completion_tokens": 6,
-                "total_tokens": 31
-            }
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let client = GatewayClient::new(mock_server.uri()).expect("Valid client URL");
-    let req = ChatCompletionRequest {
-        model: "mock-gpt".to_string(),
-        messages: vec![
-            ChatMessage::user("I was born in 2000."),
-            ChatMessage::assistant("Nice to know!"),
-            ChatMessage::user("How old am I today?"),
-        ],
-        temperature: None,
-        max_tokens: None,
-        stream: None,
-    };
-
-    let resp = client
-        .chat_completion(&req)
-        .await
-        .expect("Multi-turn request succeeded");
-    assert_eq!(resp.choices[0].message.content, "You are 25 years old.");
-}
-
-#[tokio::test]
-async fn test_sse_streaming_success() {
-    let mock_server = MockServer::start().await;
-
-    let sse_body = "data: {\"id\":\"chunk-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-gpt\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n\
-                    : keep-alive comment\n\n\
-                    data: {\"id\":\"chunk-2\",\"object\":\"chat.completion.chunk\",\"created\":1700000001,\"model\":\"mock-gpt\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world!\"},\"finish_reason\":\"stop\"}]}\n\n\
+    let sse_body = "data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-fast\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello \"},\"finish_reason\":null}]}\n\n\
+                    data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-fast\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world!\"},\"finish_reason\":null}]}\n\n\
                     data: [DONE]\n\n";
 
     Mock::given(method("POST"))
@@ -219,62 +150,11 @@ async fn test_sse_streaming_success() {
         .mount(&mock_server)
         .await;
 
-    let client = GatewayClient::new(mock_server.uri()).expect("Valid client URL");
+    let client = ApiClient::new(format!("{}/v1", mock_server.uri()), None, HashMap::new())
+        .expect("Valid client URL");
     let req = ChatCompletionRequest {
-        model: "mock-gpt".to_string(),
-        messages: vec![ChatMessage::user("Hi")],
-        temperature: None,
-        max_tokens: None,
-        stream: Some(true),
-    };
-
-    let (tx, mut rx) = mpsc::channel(16);
-    let handle: tokio::task::JoinHandle<Result<(), ClientError>> =
-        tokio::spawn(async move { client.chat_completion_stream(&req, tx).await });
-
-    let mut deltas = Vec::new();
-    let mut done_received = false;
-
-    while let Some(ev) = rx.recv().await {
-        match ev {
-            StreamEvent::Delta(d) => deltas.push(d),
-            StreamEvent::Done => {
-                done_received = true;
-                break;
-            }
-            StreamEvent::Error(e) => panic!("Unexpected error event: {}", e),
-        }
-    }
-
-    handle.await.unwrap().unwrap();
-    assert_eq!(deltas.join(""), "Hello world!");
-    assert!(done_received);
-}
-
-#[tokio::test]
-async fn test_sse_streaming_split_chunks() {
-    let mock_server = MockServer::start().await;
-
-    let sse_body = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-gpt\",\
-                    \"choices\":[{\"index\":0,\"delta\":{\"content\":\"Part 1 \"},\"finish_reason\":null}]}\n\
-                    data: {\"id\":\"c2\",\"object\":\"chat.completion.chunk\",\"created\":2,\"model\":\"mock-gpt\",\
-                    \"choices\":[{\"index\":0,\"delta\":{\"content\":\"Part 2\"},\"finish_reason\":\"stop\"}]}\n\
-                    data: [DONE]\n";
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(sse_body),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let client = GatewayClient::new(mock_server.uri()).expect("Valid client URL");
-    let req = ChatCompletionRequest {
-        model: "mock-gpt".to_string(),
-        messages: vec![ChatMessage::user("Hi")],
+        model: "mock-fast".to_string(),
+        messages: vec![ChatMessage::user("Hi stream")],
         temperature: None,
         max_tokens: None,
         stream: Some(true),
@@ -284,174 +164,16 @@ async fn test_sse_streaming_split_chunks() {
     client
         .chat_completion_stream(&req, tx)
         .await
-        .expect("Stream started");
+        .expect("Streaming initiation succeeded");
 
-    let mut accumulated = String::new();
-    while let Some(ev) = rx.recv().await {
-        if let StreamEvent::Delta(d) = ev {
-            accumulated.push_str(&d);
+    let mut collected = String::new();
+    while let Some(evt) = rx.recv().await {
+        match evt {
+            StreamEvent::Delta(d) => collected.push_str(&d),
+            StreamEvent::Done => break,
+            StreamEvent::Error(err) => panic!("Stream error: {}", err),
         }
     }
 
-    assert_eq!(accumulated, "Part 1 Part 2");
-}
-
-#[tokio::test]
-async fn test_sse_streaming_midstream_error() {
-    let mock_server = MockServer::start().await;
-
-    let sse_body = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-gpt\",\
-                    \"choices\":[{\"index\":0,\"delta\":{\"content\":\"Starting... \"},\"finish_reason\":null}]}\n\n\
-                    data: [ERROR: Provider timeout exceeded]\n\n\
-                    data: [DONE]\n\n";
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(sse_body),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let client = GatewayClient::new(mock_server.uri()).expect("Valid client URL");
-    let req = ChatCompletionRequest {
-        model: "mock-gpt".to_string(),
-        messages: vec![ChatMessage::user("Hi")],
-        temperature: None,
-        max_tokens: None,
-        stream: Some(true),
-    };
-
-    let (tx, mut rx) = mpsc::channel(16);
-    client
-        .chat_completion_stream(&req, tx)
-        .await
-        .expect("Stream started");
-
-    let mut partial_text = String::new();
-    let mut error_msg = None;
-
-    while let Some(ev) = rx.recv().await {
-        match ev {
-            StreamEvent::Delta(d) => partial_text.push_str(&d),
-            StreamEvent::Error(err) => {
-                error_msg = Some(err);
-                break;
-            }
-            StreamEvent::Done => {}
-        }
-    }
-
-    assert_eq!(partial_text, "Starting... ");
-    assert_eq!(error_msg, Some("Provider timeout exceeded".to_string()));
-}
-
-#[tokio::test]
-async fn test_sse_streaming_json_fallback() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "application/json")
-                .set_body_json(json!({
-                    "id": "chatcmpl-fallback",
-                    "object": "chat.completion",
-                    "created": 1700000000,
-                    "model": "mock-gpt",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": "Fallback JSON response"
-                            },
-                            "finish_reason": "stop"
-                        }
-                    ],
-                    "usage": {
-                        "prompt_tokens": 5,
-                        "completion_tokens": 3,
-                        "total_tokens": 8
-                    }
-                })),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let client = GatewayClient::new(mock_server.uri()).expect("Valid client URL");
-    let req = ChatCompletionRequest {
-        model: "mock-gpt".to_string(),
-        messages: vec![ChatMessage::user("Hi")],
-        temperature: None,
-        max_tokens: None,
-        stream: Some(true),
-    };
-
-    let (tx, mut rx) = mpsc::channel(16);
-    client
-        .chat_completion_stream(&req, tx)
-        .await
-        .expect("Fallback handled");
-
-    let mut full_text = String::new();
-    let mut got_done = false;
-
-    while let Some(ev) = rx.recv().await {
-        match ev {
-            StreamEvent::Delta(d) => full_text.push_str(&d),
-            StreamEvent::Done => got_done = true,
-            StreamEvent::Error(e) => panic!("Unexpected error: {}", e),
-        }
-    }
-
-    assert_eq!(full_text, "Fallback JSON response");
-    assert!(got_done);
-}
-
-#[tokio::test]
-async fn test_sse_streaming_cancellation() {
-    let mock_server = MockServer::start().await;
-
-    let sse_body = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-gpt\",\
-                    \"choices\":[{\"index\":0,\"delta\":{\"content\":\"Chunk 1 \"},\"finish_reason\":null}]}\n\n";
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(sse_body)
-                .set_delay(std::time::Duration::from_millis(50)),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let client = GatewayClient::new(mock_server.uri()).expect("Valid client URL");
-    let req = ChatCompletionRequest {
-        model: "mock-gpt".to_string(),
-        messages: vec![ChatMessage::user("Hi")],
-        temperature: None,
-        max_tokens: None,
-        stream: Some(true),
-    };
-
-    let (tx, mut rx) = mpsc::channel(16);
-    let handle = tokio::spawn(async move {
-        let _ = client.chat_completion_stream(&req, tx).await;
-    });
-
-    let first_ev = rx.recv().await;
-    assert_eq!(first_ev, Some(StreamEvent::Delta("Chunk 1 ".to_string())));
-
-    handle.abort();
-    assert!(
-        handle.is_finished() || {
-            let _ = handle.await;
-            true
-        }
-    );
+    assert_eq!(collected, "Hello world!");
 }

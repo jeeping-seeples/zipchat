@@ -1,11 +1,12 @@
 # Blockers and open questions
 
-- Which platforms must be supported first?
-- Is the intended UI toolkit already present in the repository? If not, which toolkit should be approved?
-- Is this intended to remain an egui desktop client, or are other targets required?
-- What gateway authentication method will be supported?
-- What exact gateway API contract will be approved?
-- What local persistence format and export behavior are wanted?
-- Which streaming protocol will the gateway expose?
+## Resolved in Pivot Phase 0
+- Direct provider communication approved (ZD-010).
+- Standardized OpenAI HTTP API contract (ZD-011).
+- API key security & keyring/secrets file approach (ZD-012).
+
+## Active open questions for Pivot Phase 1 & 2
+- Approval of proposed `settings.json` schema v2 and migration path in `docs/SETTINGS_SCHEMA_DRAFT.md`.
+- Keyring crate selection: evaluate `keyring` crate compatibility with cross-compilation on Raspberry Pi OS ARM64.
 
 Do not guess. Record evidence and ask for decisions.
