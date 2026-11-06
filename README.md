@@ -1,20 +1,28 @@
 # ZipChat
 
-A separate, lightweight chat client for the Universal AI Gateway.
+A lightweight, standalone desktop AI chat application built in Rust with `egui` / `eframe`.
 
-ZipChat owns the user experience: conversations, model selection, settings, and presentation. It does not own provider API integrations or routing logic; those belong in `universal-ai-gateway`.
+ZipChat connects directly to OpenAI-compatible hosted APIs (OpenAI, OpenRouter, Groq, Cerebras, Together, Mistral, DeepSeek, Gemini OpenAI endpoint) and local model inference servers (Ollama, LM Studio, or Universal AI Gateway as a preset).
 
 ## Principles
 
-- Rust application; current UI toolkit and platform targets must be confirmed by the audit.
-- Consume the gateway's documented API rather than inventing endpoints.
-- Keep the client responsive and resource-conscious.
-- Make connection state, errors, and streaming state visible.
-- Keep secrets out of logs and source control.
-- Build incrementally with human approval at each task boundary.
+- **Standalone Native Application**: Direct communication with any OpenAI-compatible API; no mandatory gateway proxy, browser runtime, or heavy webviews.
+- **Privacy & Security**: Credentials and conversations remain strictly local. API keys are kept out of settings files, logs, and exports.
+- **Resource-Conscious & Fast**: Efficient and lightweight, optimized for modest hardware including Raspberry Pi OS (ARM64).
+- **Responsive UI**: Real-time token SSE streaming, connection state visibility, accessible keyboard navigation, and smart auto-scrolling.
+- **Atomic Local Persistence**: Reliable, crash-resilient local storage in standard platform configuration directories.
 
-## Dependency
+## Supported Providers & Presets
 
-Gateway repository: `https://github.com/jeeping-seeples/universal-ai-gateway`
-
-The gateway API is not frozen yet. Do not implement network calls until its contract is confirmed.
+- OpenAI (`https://api.openai.com/v1`)
+- OpenRouter (`https://openrouter.ai/api/v1`)
+- Groq (`https://api.groq.com/openai/v1`)
+- Cerebras (`https://api.cerebras.ai/v1`)
+- Together AI (`https://api.together.xyz/v1`)
+- Mistral (`https://api.mistral.ai/v1`)
+- DeepSeek (`https://api.deepseek.com/v1`)
+- Google Gemini OpenAI Endpoint (`https://generativelanguage.googleapis.com/v1beta/openai/`)
+- Ollama (`http://localhost:11434/v1`)
+- LM Studio (`http://localhost:1234/v1`)
+- Universal AI Gateway (`http://127.0.0.1:9471/v1`)
+- Custom OpenAI-compatible endpoints
