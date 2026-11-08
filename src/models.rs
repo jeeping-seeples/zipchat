@@ -189,7 +189,11 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
-    #[serde(rename = "providerOptions", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "providerOptions",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub provider_options: Option<serde_json::Value>,
 }
 

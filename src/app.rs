@@ -898,7 +898,9 @@ impl ZipChatApp {
                             p.models = model_list.data.iter().map(|m| m.id.clone()).collect();
                             p.model_pricing.clear();
                             for m in &model_list.data {
-                                if let Some(summary) = m.pricing.as_ref().and_then(|pr| pr.display_summary()) {
+                                if let Some(summary) =
+                                    m.pricing.as_ref().and_then(|pr| pr.display_summary())
+                                {
                                     p.model_pricing.insert(m.id.clone(), summary);
                                 }
                             }
@@ -934,7 +936,9 @@ impl ZipChatApp {
                                 p.models = model_list.data.iter().map(|m| m.id.clone()).collect();
                                 p.model_pricing.clear();
                                 for m in &model_list.data {
-                                    if let Some(summary) = m.pricing.as_ref().and_then(|pr| pr.display_summary()) {
+                                    if let Some(summary) =
+                                        m.pricing.as_ref().and_then(|pr| pr.display_summary())
+                                    {
                                         p.model_pricing.insert(m.id.clone(), summary);
                                     }
                                 }
@@ -1295,7 +1299,8 @@ impl eframe::App for ZipChatApp {
                         ui.separator();
 
                         let query = self.model_search_query.to_lowercase();
-                        let active_provider_opt = self.providers.iter().find(|p| p.id == active_pid);
+                        let active_provider_opt =
+                            self.providers.iter().find(|p| p.id == active_pid);
 
                         if !self.pinned_models.is_empty() {
                             let mut pinned_header_drawn = false;
@@ -1307,7 +1312,9 @@ impl eframe::App for ZipChatApp {
                                 }
                                 if query.is_empty() || pinned.to_lowercase().contains(&query) {
                                     if !pinned_header_drawn {
-                                        ui.label(egui::RichText::new("★ Pinned").strong().size(11.0));
+                                        ui.label(
+                                            egui::RichText::new("★ Pinned").strong().size(11.0),
+                                        );
                                         pinned_header_drawn = true;
                                     }
                                     ui.horizontal(|ui| {
@@ -1320,7 +1327,9 @@ impl eframe::App for ZipChatApp {
                                         }
                                         if let Some(p) = active_provider_opt {
                                             if let Some(price) = p.model_pricing.get(pinned) {
-                                                ui.label(egui::RichText::new(price).weak().size(10.0));
+                                                ui.label(
+                                                    egui::RichText::new(price).weak().size(10.0),
+                                                );
                                             }
                                         }
                                     });
