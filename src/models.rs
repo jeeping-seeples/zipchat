@@ -49,6 +49,46 @@ impl Provider {
             !b_lower.is_empty() && (m_lower == b_lower || m_lower.contains(&b_lower))
         })
     }
+
+    pub fn service_tier(&self) -> Option<String> {
+        self.provider_options
+            .as_ref()
+            .and_then(|opt| opt.get("gateway"))
+            .and_then(|gw| gw.get("serviceTier"))
+            .and_then(|st| st.as_str())
+            .map(|s| s.to_string())
+    }
+
+    pub fn set_service_tier(&mut self, tier: Option<&str>) {
+        let t = tier.map(|s| s.trim()).unwrap_or("");
+        if t.is_empty() || t.eq_ignore_ascii_case("none") || t.eq_ignore_ascii_case("default") {
+            if let Some(opt) = self
+                .provider_options
+                .as_mut()
+                .and_then(|o| o.as_object_mut())
+            {
+                if let Some(gw) = opt.get_mut("gateway").and_then(|g| g.as_object_mut()) {
+                    gw.remove("serviceTier");
+                    if gw.is_empty() {
+                        opt.remove("gateway");
+                    }
+                }
+                if opt.is_empty() {
+                    self.provider_options = None;
+                }
+            }
+        } else {
+            let mut opt = self
+                .provider_options
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({}));
+            if !opt.is_object() {
+                opt = serde_json::json!({});
+            }
+            opt["gateway"]["serviceTier"] = serde_json::Value::String(t.to_string());
+            self.provider_options = Some(opt);
+        }
+    }
 }
 
 /// Flexible pricing metadata parsed from GET {base}/models
@@ -319,6 +359,8 @@ pub struct Conversation {
     pub max_tokens: Option<u32>,
     pub messages: Vec<LocalMessage>,
     pub created_at_epoch_secs: u64,
+    #[serde(default)]
+    pub updated_at_epoch_secs: Option<u64>,
 }
 
 impl Conversation {
@@ -342,6 +384,13 @@ impl Conversation {
             max_tokens: None,
             messages: Vec::new(),
             created_at_epoch_secs: now,
+            updated_at_epoch_secs: Some(now),
         }
+    }
+
+    pub fn last_activity_secs(&self) -> u64 {
+        self.updated_at_epoch_secs
+            .or_else(|| self.messages.last().map(|m| m.timestamp_epoch_secs))
+            .unwrap_or(self.created_at_epoch_secs)
     }
 }

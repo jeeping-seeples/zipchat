@@ -245,14 +245,7 @@ fn test_default_presets_include_vercel() {
     assert_eq!(vercel.name, "Vercel AI Gateway");
     assert_eq!(vercel.base_url, "https://ai-gateway.vercel.sh/v1");
     assert!(vercel.models.contains(&"openai/gpt-4o".to_string()));
-    assert_eq!(
-        vercel.provider_options,
-        Some(serde_json::json!({
-            "gateway": {
-                "serviceTier": "flex"
-            }
-        }))
-    );
+    assert!(vercel.models.contains(&"openai/o3-mini".to_string()));
 }
 
 #[test]
@@ -270,4 +263,62 @@ fn test_provider_model_blacklist_filtering() {
     assert!(!provider.is_model_blacklisted("meta-llama/llama-3"));
     assert!(provider.is_model_blacklisted("openai/whisper-large"));
     assert!(provider.is_model_blacklisted("text-embedding-3-small"));
+}
+
+#[tokio::test]
+async fn test_conversation_rename_and_activity_order() {
+    let temp_dir = std::env::temp_dir().join(format!("zipchat_test_conv_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    let storage = StorageManager::new(Some(temp_dir.clone()));
+    let mut app = zipchat::app::ZipChatApp::new_test(storage);
+
+    app.create_conversation();
+    let conv1_id = app.conversations[0].id.clone();
+    assert_eq!(app.conversations[0].title, "Chat 1");
+
+    app.rename_conversation(&conv1_id, "Project Discussion");
+    assert_eq!(app.conversations[0].title, "Project Discussion");
+
+    // Create second conversation with later activity
+    app.create_conversation();
+    assert_eq!(app.conversations.len(), 2);
+    let conv2_id = app.conversations[1].id.clone();
+
+    // Verify ordering by last_activity_secs
+    let activity1 = app.conversations[0].last_activity_secs();
+    let activity2 = app.conversations[1].last_activity_secs();
+    assert!(activity2 >= activity1);
+
+    app.delete_conversation(&conv2_id);
+    assert_eq!(app.conversations.len(), 1);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_provider_status_dot() {
+    let temp_dir = std::env::temp_dir().join(format!("zipchat_test_status_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    let storage = StorageManager::new(Some(temp_dir.clone()));
+    let mut app = zipchat::app::ZipChatApp::new_test(storage);
+
+    // Initial state: untracked/ready
+    let (_, tip) = app.provider_status_dot("openai");
+    assert!(tip.contains("Ready") || tip.contains("Online"));
+
+    // Add error state
+    app.provider_refresh_errors
+        .insert("openai".to_string(), "Connection refused".to_string());
+    let (err_color, err_tip) = app.provider_status_dot("openai");
+    assert_eq!(err_color, egui::Color32::RED);
+    assert!(err_tip.contains("Connection refused"));
+
+    // Add refreshing state
+    app.refreshing_providers.insert("openai".to_string());
+    let (ref_color, _) = app.provider_status_dot("openai");
+    assert_eq!(ref_color, egui::Color32::YELLOW);
+
+    let _ = fs::remove_dir_all(&temp_dir);
 }

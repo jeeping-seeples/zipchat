@@ -60,10 +60,10 @@ pub enum AppMessage {
 }
 
 pub struct ZipChatApp {
+    pub storage: StorageManager,
     pub providers: Vec<Provider>,
     pub api_keys: HashMap<String, String>,
     pub active_provider_id: String,
-    pub status: ConnectionStatus,
     pub stream_enabled: bool,
     pub auto_scroll_enabled: bool,
     pub pinned_models: Vec<String>,
@@ -76,6 +76,12 @@ pub struct ZipChatApp {
     pub model_search_query: String,
     pub manual_model_input: String,
     pub blacklist_input: String,
+    pub show_hidden_models: bool,
+    pub show_sidebar: bool,
+    pub conversation_search_query: String,
+    pub editing_conversation_id: Option<String>,
+    pub editing_conversation_title: String,
+    pub model_sort_by_price: bool,
     pub refreshing_providers: HashSet<String>,
     pub provider_refresh_errors: HashMap<String, String>,
     pub conversations: Vec<Conversation>,
@@ -83,7 +89,6 @@ pub struct ZipChatApp {
     pub composer_input: String,
     pub show_clear_confirm: bool,
     pub toast_message: Option<(String, f64)>,
-    storage: StorageManager,
     active_task: Option<JoinHandle<()>>,
     tx: Sender<AppMessage>,
     rx: Receiver<AppMessage>,
@@ -135,6 +140,12 @@ impl ZipChatApp {
             model_search_query: String::new(),
             manual_model_input: String::new(),
             blacklist_input: String::new(),
+            show_hidden_models: true,
+            show_sidebar: true,
+            conversation_search_query: String::new(),
+            editing_conversation_id: None,
+            editing_conversation_title: String::new(),
+            model_sort_by_price: false,
             refreshing_providers: HashSet::new(),
             provider_refresh_errors: HashMap::new(),
             conversations: loaded_convs,
@@ -314,9 +325,71 @@ impl ZipChatApp {
 
     pub fn remove_blacklist_model(&mut self, provider_id: &str, pattern: &str) {
         if let Some(p) = self.providers.iter_mut().find(|p| p.id == provider_id) {
-            p.model_blacklist.retain(|b| b != pattern);
+            let pat_lower = pattern.trim().to_lowercase();
+            p.model_blacklist.retain(|b| {
+                let b_lower = b.trim().to_lowercase();
+                b != pattern && !(pat_lower.contains(&b_lower) && !b_lower.is_empty())
+            });
             self.persist_settings();
         }
+    }
+
+    pub fn clear_blacklist(&mut self, provider_id: &str) {
+        if let Some(p) = self.providers.iter_mut().find(|p| p.id == provider_id) {
+            if !p.model_blacklist.is_empty() {
+                p.model_blacklist.clear();
+                self.persist_settings();
+            }
+        }
+    }
+
+    pub fn delete_message(&mut self, message_id: &str) {
+        if let Some(conv) = self.active_conversation_mut() {
+            conv.messages.retain(|m| m.id != message_id);
+            self.persist_conversations();
+        }
+    }
+
+    pub fn rename_conversation(&mut self, conv_id: &str, new_title: &str) {
+        let trimmed = new_title.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if let Some(conv) = self.conversations.iter_mut().find(|c| c.id == conv_id) {
+            conv.title = trimmed.to_string();
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            conv.updated_at_epoch_secs = Some(now);
+            self.persist_conversations();
+        }
+        self.editing_conversation_id = None;
+        self.editing_conversation_title.clear();
+    }
+
+    pub fn provider_status_dot(&self, provider_id: &str) -> (egui::Color32, String) {
+        if self.refreshing_providers.contains(provider_id) {
+            return (egui::Color32::YELLOW, "Refreshing models...".to_string());
+        }
+        if let Some(err) = self.provider_refresh_errors.get(provider_id) {
+            return (egui::Color32::RED, format!("Error: {}", err));
+        }
+        if let Some(p) = self.providers.iter().find(|p| p.id == provider_id) {
+            if !p.enabled {
+                return (egui::Color32::GRAY, "Disabled".to_string());
+            }
+            if let Some(_ts) = p.models_fetched_at {
+                return (
+                    egui::Color32::from_rgb(80, 220, 100),
+                    format!("Online: {} models cached", p.models.len()),
+                );
+            }
+        }
+        (
+            egui::Color32::from_rgb(160, 160, 160),
+            "Ready (untested)".to_string(),
+        )
     }
 
     pub fn toggle_pin_model(&mut self, model: &str) {
@@ -560,14 +633,19 @@ impl ZipChatApp {
             usage: None,
         };
 
-        let mut history: Vec<ChatMessage> = Vec::new();
         let mut model = "gpt-4o".to_string();
         let mut provider_id = self.active_provider_id.clone();
         let mut temp = self.global_temperature;
         let mut max_tok = self.global_max_tokens;
         let mut sys_prompt = self.global_system_prompt.clone();
+        let mut history = Vec::new();
 
         if let Some(conv) = self.active_conversation_mut() {
+            conv.updated_at_epoch_secs = Some(now);
+            if conv.title.starts_with("Chat ") && conv.messages.is_empty() {
+                conv.title = format!("Chat {}", now);
+            }
+
             if conv.messages.is_empty() {
                 let preview: String = text.chars().take(24).collect();
                 conv.title = if preview.len() < text.len() {
@@ -746,7 +824,7 @@ impl ZipChatApp {
         user_message_id: String,
         assistant_message_id: String,
         provider_id: String,
-        model: String,
+        mut model: String,
         temperature: Option<f32>,
         max_tokens: Option<u32>,
         messages: Vec<ChatMessage>,
@@ -763,6 +841,21 @@ impl ZipChatApp {
         let api_key = self.api_keys.get(&provider_id).cloned();
         let stream = self.stream_enabled;
         let tx = self.tx.clone();
+
+        let is_vercel = provider_id == "vercel" || base_url.contains("ai-gateway.vercel.sh");
+        if is_vercel && !model.contains('/') {
+            if model.starts_with("gpt-")
+                || model.starts_with("o1")
+                || model.starts_with("o3")
+                || model.starts_with("text-")
+            {
+                model = format!("openai/{}", model);
+            } else if model.starts_with("claude-") {
+                model = format!("anthropic/{}", model);
+            } else if model.starts_with("gemini-") {
+                model = format!("google/{}", model);
+            }
+        }
 
         let handle = tokio::spawn(async move {
             let client = match ApiClient::new(&base_url, api_key, headers) {
@@ -781,15 +874,13 @@ impl ZipChatApp {
             let provider_options = provider
                 .as_ref()
                 .and_then(|p| p.provider_options.clone())
-                .or_else(|| {
-                    if provider_id == "vercel" || base_url.contains("ai-gateway.vercel.sh") {
-                        Some(serde_json::json!({
-                            "gateway": {
-                                "serviceTier": "flex"
-                            }
-                        }))
+                .filter(|opt| {
+                    if let Some(gw) = opt.get("gateway").and_then(|g| g.as_object()) {
+                        !gw.is_empty()
+                    } else if let Some(o) = opt.as_object() {
+                        !o.is_empty()
                     } else {
-                        None
+                        false
                     }
                 });
 
@@ -1125,144 +1216,272 @@ impl eframe::App for ZipChatApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_messages();
 
+        if self.is_generating() || !self.refreshing_providers.is_empty() {
+            ctx.request_repaint();
+        }
+
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.is_generating() {
+            if self.show_clear_confirm {
+                self.show_clear_confirm = false;
+            } else if self.show_settings_modal {
+                self.show_settings_modal = false;
+            } else if self.is_generating() {
                 self.cancel_generation();
-            } else {
-                self.composer_input.clear();
             }
+        }
+
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::B)) {
+            self.show_sidebar = !self.show_sidebar;
+        }
+
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::N)) {
+            self.create_conversation();
+        }
+
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Comma)) {
+            self.show_settings_modal = !self.show_settings_modal;
         }
 
         let mut conv_to_delete = None;
         let mut remove_provider_id = None;
+        let mut start_rename = None;
+        let mut save_rename = None;
+        let mut cancel_rename = false;
 
-        egui::SidePanel::left("sidebar_panel")
-            .resizable(true)
-            .default_width(280.0)
-            .width_range(220.0..=380.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("ZipChat");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("⚙ Settings").clicked() {
-                            self.show_settings_modal = true;
-                        }
-                    });
-                });
-                ui.separator();
-
-                ui.collapsing("Quick Settings", |ui| {
+        if self.show_sidebar {
+            egui::SidePanel::left("sidebar_panel")
+                .resizable(true)
+                .default_width(280.0)
+                .width_range(220.0..=380.0)
+                .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Provider:");
-                        let active_name = self
-                            .current_provider()
-                            .map(|p| p.name.clone())
-                            .unwrap_or_else(|| "Select Provider".to_string());
-
-                        egui::ComboBox::from_id_salt("quick_provider_select")
-                            .selected_text(active_name)
-                            .show_ui(ui, |ui| {
-                                for p in &self.providers {
-                                    let is_active = p.id == self.active_provider_id;
-                                    if ui.selectable_label(is_active, &p.name).clicked() {
-                                        self.active_provider_id = p.id.clone();
-                                    }
-                                }
-                            });
-                    });
-
-                    let mut settings_changed = false;
-                    let mut secrets_changed = false;
-                    let current_pid = self.active_provider_id.clone();
-
-                    if let Some(_provider) = self.providers.iter_mut().find(|p| p.id == current_pid)
-                    {
-                        let key_entry = self.api_keys.entry(current_pid.clone()).or_default();
-                        ui.horizontal(|ui| {
-                            ui.label("API Key:");
+                        ui.heading("ZipChat");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
-                                .add(egui::TextEdit::singleline(key_entry).password(true))
-                                .changed()
-                            {
-                                secrets_changed = true;
-                            }
-                        });
-
-                        ui.horizontal(|ui| {
-                            let is_refreshing = self.refreshing_providers.contains(&current_pid);
-                            if ui
-                                .add_enabled(!is_refreshing, egui::Button::new("Refresh Models"))
+                                .button("◀")
+                                .on_hover_text("Collapse sidebar (Ctrl+B)")
                                 .clicked()
                             {
-                                self.trigger_background_model_fetch(&current_pid);
+                                self.show_sidebar = false;
                             }
-
-                            if ui.button("Manage...").clicked() {
+                            if ui.button("⚙ Settings").clicked() {
                                 self.show_settings_modal = true;
                             }
                         });
-                    }
+                    });
+                    ui.separator();
 
-                    ui.add_space(4.0);
-                    if ui
-                        .checkbox(&mut self.stream_enabled, "Streaming (SSE)")
-                        .changed()
-                    {
-                        settings_changed = true;
-                    }
-                    if ui
-                        .checkbox(&mut self.auto_scroll_enabled, "Auto-scroll")
-                        .changed()
-                    {
-                        settings_changed = true;
-                    }
+                    ui.collapsing("Quick Settings", |ui| {
+                        ui.horizontal(|ui| {
+                            let (dot_color, dot_tip) =
+                                self.provider_status_dot(&self.active_provider_id);
+                            ui.colored_label(dot_color, "●").on_hover_text(dot_tip);
+                            ui.label("Provider:");
+                            let active_name = self
+                                .current_provider()
+                                .map(|p| p.name.clone())
+                                .unwrap_or_else(|| "Select Provider".to_string());
 
-                    if settings_changed {
-                        self.persist_settings();
-                    }
-                    if secrets_changed {
-                        self.persist_secrets();
-                    }
-                });
+                            egui::ComboBox::from_id_salt("quick_provider_select")
+                                .selected_text(active_name)
+                                .show_ui(ui, |ui| {
+                                    for p in &self.providers {
+                                        let is_active = p.id == self.active_provider_id;
+                                        let (p_dot, p_tip) = self.provider_status_dot(&p.id);
+                                        ui.horizontal(|ui| {
+                                            ui.colored_label(p_dot, "●").on_hover_text(p_tip);
+                                            if ui.selectable_label(is_active, &p.name).clicked() {
+                                                self.active_provider_id = p.id.clone();
+                                            }
+                                        });
+                                    }
+                                });
+                        });
 
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.heading("Conversations");
-                    if ui.button("+ New").clicked() {
-                        self.create_conversation();
-                    }
-                });
-                ui.add_space(4.0);
+                        let mut settings_changed = false;
+                        let mut secrets_changed = false;
+                        let current_pid = self.active_provider_id.clone();
 
-                egui::ScrollArea::vertical()
-                    .id_salt("conv_list")
-                    .show(ui, |ui| {
-                        let active_id = self.active_conversation_id.clone();
-                        for conv in &self.conversations {
+                        if let Some(_provider) =
+                            self.providers.iter_mut().find(|p| p.id == current_pid)
+                        {
+                            let key_entry = self.api_keys.entry(current_pid.clone()).or_default();
                             ui.horizontal(|ui| {
-                                let is_active = active_id.as_deref() == Some(&conv.id);
-                                if ui.selectable_label(is_active, &conv.title).clicked() {
-                                    self.active_conversation_id = Some(conv.id.clone());
+                                ui.label("API Key:");
+                                if ui
+                                    .add(egui::TextEdit::singleline(key_entry).password(true))
+                                    .changed()
+                                {
+                                    secrets_changed = true;
+                                }
+                            });
+
+                            ui.horizontal(|ui| {
+                                let is_refreshing =
+                                    self.refreshing_providers.contains(&current_pid);
+                                if ui
+                                    .add_enabled(
+                                        !is_refreshing,
+                                        egui::Button::new("Refresh Models"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.trigger_background_model_fetch(&current_pid);
                                 }
 
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui.small_button("🗑").clicked() {
-                                            conv_to_delete = Some(conv.id.clone());
-                                        }
-                                    },
-                                );
+                                if ui.button("Manage...").clicked() {
+                                    self.show_settings_modal = true;
+                                }
                             });
+                        }
+
+                        ui.add_space(4.0);
+                        if ui
+                            .checkbox(&mut self.stream_enabled, "Streaming (SSE)")
+                            .changed()
+                        {
+                            settings_changed = true;
+                        }
+                        if ui
+                            .checkbox(&mut self.auto_scroll_enabled, "Auto-scroll")
+                            .changed()
+                        {
+                            settings_changed = true;
+                        }
+
+                        if settings_changed {
+                            self.persist_settings();
+                        }
+                        if secrets_changed {
+                            self.persist_secrets();
                         }
                     });
 
-                ui.add_space(8.0);
-                ui.separator();
-                if ui.button("Clear All History").clicked() {
-                    self.show_clear_confirm = true;
-                }
-            });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.heading("Conversations");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .button("+ New")
+                                .on_hover_text("New conversation (Ctrl+N)")
+                                .clicked()
+                            {
+                                self.create_conversation();
+                            }
+                        });
+                    });
+                    ui.add_space(2.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.conversation_search_query)
+                            .hint_text("🔍 Search chats..."),
+                    );
+                    ui.add_space(4.0);
+
+                    egui::ScrollArea::vertical()
+                        .id_salt("conv_list")
+                        .show(ui, |ui| {
+                            let active_id = self.active_conversation_id.clone();
+                            let query = self.conversation_search_query.trim().to_lowercase();
+
+                            let mut sorted_indices: Vec<usize> =
+                                (0..self.conversations.len()).collect();
+                            sorted_indices.sort_by(|&a, &b| {
+                                let time_a = self.conversations[a].last_activity_secs();
+                                let time_b = self.conversations[b].last_activity_secs();
+                                time_b.cmp(&time_a)
+                            });
+
+                            for idx in sorted_indices {
+                                let conv = &self.conversations[idx];
+
+                                if !query.is_empty() {
+                                    let matches_title = conv.title.to_lowercase().contains(&query);
+                                    let matches_msg = conv
+                                        .messages
+                                        .iter()
+                                        .any(|m| m.content.to_lowercase().contains(&query));
+                                    if !matches_title && !matches_msg {
+                                        continue;
+                                    }
+                                }
+
+                                if self.editing_conversation_id.as_deref() == Some(&conv.id) {
+                                    ui.horizontal(|ui| {
+                                        let response = ui.add(
+                                            egui::TextEdit::singleline(
+                                                &mut self.editing_conversation_title,
+                                            )
+                                            .desired_width(160.0),
+                                        );
+                                        if response.lost_focus()
+                                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                        {
+                                            save_rename = Some((
+                                                conv.id.clone(),
+                                                self.editing_conversation_title.clone(),
+                                            ));
+                                        }
+                                        if ui.small_button("✔").clicked() {
+                                            save_rename = Some((
+                                                conv.id.clone(),
+                                                self.editing_conversation_title.clone(),
+                                            ));
+                                        }
+                                        if ui.small_button("✕").clicked() {
+                                            cancel_rename = true;
+                                        }
+                                    });
+                                } else {
+                                    ui.horizontal(|ui| {
+                                        let is_active = active_id.as_deref() == Some(&conv.id);
+                                        if ui.selectable_label(is_active, &conv.title).clicked() {
+                                            self.active_conversation_id = Some(conv.id.clone());
+                                        }
+
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .small_button("🗑")
+                                                    .on_hover_text("Delete chat")
+                                                    .clicked()
+                                                {
+                                                    conv_to_delete = Some(conv.id.clone());
+                                                }
+                                                if ui
+                                                    .small_button("✎")
+                                                    .on_hover_text("Rename chat")
+                                                    .clicked()
+                                                {
+                                                    start_rename =
+                                                        Some((conv.id.clone(), conv.title.clone()));
+                                                }
+                                            },
+                                        );
+                                    });
+                                }
+                            }
+                        });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    if ui.button("Clear All History").clicked() {
+                        self.show_clear_confirm = true;
+                    }
+                });
+        }
+
+        if let Some((id, title)) = start_rename {
+            self.editing_conversation_id = Some(id);
+            self.editing_conversation_title = title;
+        }
+        if let Some((id, new_title)) = save_rename {
+            self.rename_conversation(&id, &new_title);
+        }
+        if cancel_rename {
+            self.editing_conversation_id = None;
+            self.editing_conversation_title.clear();
+        }
 
         if let Some(id) = conv_to_delete {
             self.delete_conversation(&id);
@@ -1277,6 +1496,16 @@ impl eframe::App for ZipChatApp {
                 .unwrap_or_else(|| "No conversation".to_string());
 
             ui.horizontal(|ui| {
+                if !self.show_sidebar {
+                    if ui
+                        .button("☰")
+                        .on_hover_text("Show sidebar (Ctrl+B)")
+                        .clicked()
+                    {
+                        self.show_sidebar = true;
+                    }
+                }
+
                 ui.heading(&active_title);
 
                 let active_pid = self.active_provider_id.clone();
@@ -1287,7 +1516,10 @@ impl eframe::App for ZipChatApp {
                 let mut new_selected_model = None;
                 let mut toggle_pin = None;
 
-                ui.label("| Model:");
+                let (p_dot, p_tip) = self.provider_status_dot(&active_pid);
+                ui.colored_label(p_dot, "●").on_hover_text(p_tip);
+
+                ui.label("Model:");
                 egui::ComboBox::from_id_salt("chat_model_selector")
                     .selected_text(&current_model_str)
                     .width(220.0)
@@ -1295,6 +1527,9 @@ impl eframe::App for ZipChatApp {
                         ui.horizontal(|ui| {
                             ui.label("🔍");
                             ui.text_edit_singleline(&mut self.model_search_query);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.model_sort_by_price, "Sort by Price");
                         });
                         ui.separator();
 
@@ -1345,15 +1580,29 @@ impl eframe::App for ZipChatApp {
                                 continue;
                             }
 
-                            let matching_models: Vec<&String> = provider
+                            let mut matching_models: Vec<&String> = provider
                                 .models
                                 .iter()
                                 .filter(|m| !provider.is_model_blacklisted(m))
                                 .filter(|m| query.is_empty() || m.to_lowercase().contains(&query))
                                 .collect();
 
+                            if self.model_sort_by_price {
+                                matching_models.sort_by(|a, b| {
+                                    let price_a = provider.model_pricing.get(*a);
+                                    let price_b = provider.model_pricing.get(*b);
+                                    price_a.cmp(&price_b)
+                                });
+                            } else {
+                                matching_models.sort();
+                            }
+
                             if !matching_models.is_empty() {
-                                ui.label(egui::RichText::new(&provider.name).weak().size(11.0));
+                                let (dot_c, dot_t) = self.provider_status_dot(&provider.id);
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(dot_c, "●").on_hover_text(dot_t);
+                                    ui.label(egui::RichText::new(&provider.name).weak().size(11.0));
+                                });
                                 for m in matching_models {
                                     ui.horizontal(|ui| {
                                         let is_pinned = self.pinned_models.contains(m);
@@ -1517,6 +1766,8 @@ impl eframe::App for ZipChatApp {
             let timeline_height = ui.available_height() - 70.0;
             let mut retry_id = None;
             let mut trigger_regenerate = false;
+            let mut delete_msg_id = None;
+            let mut edit_msg_content = None;
 
             let scroll_area = egui::ScrollArea::vertical()
                 .id_salt("timeline_scroll")
@@ -1549,14 +1800,19 @@ impl eframe::App for ZipChatApp {
                                     );
 
                                     if let Some(usage) = &msg.usage {
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "{} tokens",
-                                                usage.total_tokens
-                                            ))
-                                            .weak()
-                                            .size(11.0),
-                                        );
+                                        let usage_text = if usage.prompt_tokens > 0
+                                            || usage.completion_tokens > 0
+                                        {
+                                            format!(
+                                                "{} tokens ({} in, {} out)",
+                                                usage.total_tokens,
+                                                usage.prompt_tokens,
+                                                usage.completion_tokens
+                                            )
+                                        } else {
+                                            format!("{} tokens", usage.total_tokens)
+                                        };
+                                        ui.label(egui::RichText::new(usage_text).weak().size(11.0));
                                     }
 
                                     match &msg.status {
@@ -1594,6 +1850,36 @@ impl eframe::App for ZipChatApp {
                                             }
                                         }
                                     }
+
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .small_button("🗑")
+                                                .on_hover_text("Delete message")
+                                                .clicked()
+                                            {
+                                                delete_msg_id = Some(msg.id.clone());
+                                            }
+                                            if ui
+                                                .small_button("📋 Copy")
+                                                .on_hover_text("Copy message content")
+                                                .clicked()
+                                            {
+                                                ui.output_mut(|o| {
+                                                    o.copied_text = msg.content.clone();
+                                                });
+                                            }
+                                            if is_user
+                                                && ui
+                                                    .small_button("✎ Edit")
+                                                    .on_hover_text("Edit in composer")
+                                                    .clicked()
+                                            {
+                                                edit_msg_content = Some(msg.content.clone());
+                                            }
+                                        },
+                                    );
                                 });
 
                                 ui.add_space(4.0);
@@ -1621,8 +1907,12 @@ impl eframe::App for ZipChatApp {
                 }
             });
 
-            let is_at_bottom = scroll_output.state.offset.y + scroll_output.inner_rect.height()
-                >= scroll_output.content_size.y - 10.0;
+            if let Some(id) = delete_msg_id {
+                self.delete_message(&id);
+            }
+            if let Some(content) = edit_msg_content {
+                self.composer_input = content;
+            }
             if self.scroll_to_bottom && is_at_bottom {
                 ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
                 self.scroll_to_bottom = false;
@@ -1637,39 +1927,96 @@ impl eframe::App for ZipChatApp {
 
             ui.separator();
 
-            // Composer
+            // Composer with auto-expanding height and responsive Send / Stop controls
+            let line_count = self.composer_input.lines().count().max(1);
+            let composer_height = ((line_count as f32) * 19.0 + 18.0).clamp(42.0, 150.0);
+
             ui.horizontal(|ui| {
+                let action_width = 84.0;
+                let text_width = (ui.available_width() - action_width).max(100.0);
+
                 let response = ui.add_sized(
-                    [ui.available_width() - 80.0, 48.0],
+                    [text_width, composer_height],
                     egui::TextEdit::multiline(&mut self.composer_input)
+                        .desired_rows(1)
                         .hint_text("Type your message... (Shift+Enter for newline, Enter to send)"),
                 );
 
                 let is_enter_pressed =
                     ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
                 let can_send = !self.is_generating() && !self.composer_input.trim().is_empty();
-                let send_clicked = ui
-                    .add_enabled(can_send, egui::Button::new("Send"))
-                    .clicked();
 
-                if (send_clicked || (response.lost_focus() && is_enter_pressed)) && can_send {
-                    self.send_message();
-                }
+                ui.vertical(|ui| {
+                    if self.is_generating() {
+                        if ui
+                            .add_sized(
+                                [action_width, 34.0],
+                                egui::Button::new(
+                                    egui::RichText::new("⏹ Stop").color(egui::Color32::RED),
+                                ),
+                            )
+                            .on_hover_text("Cancel current generation (Esc)")
+                            .clicked()
+                        {
+                            self.cancel_generation();
+                        }
+                    } else {
+                        let send_btn = ui.add_sized(
+                            [action_width, 34.0],
+                            egui::Button::new(egui::RichText::new("Send ↵").strong()),
+                        );
+                        if (send_btn.clicked() || (response.lost_focus() && is_enter_pressed))
+                            && can_send
+                        {
+                            self.send_message();
+                        }
+                    }
+
+                    if !self.composer_input.is_empty() && !self.is_generating() {
+                        if ui
+                            .add_sized([action_width, 18.0], egui::Button::new("Clear"))
+                            .on_hover_text("Clear composer text")
+                            .clicked()
+                        {
+                            self.composer_input.clear();
+                        }
+                    }
+                });
             });
         });
 
         // Dedicated Settings Window Modal
         if self.show_settings_modal {
+            let mut modal_open = self.show_settings_modal;
+            let mut close_clicked = false;
+
             egui::Window::new("⚙ Settings")
+                .open(&mut modal_open)
                 .collapsible(false)
                 .resizable(true)
-                .default_size([640.0, 480.0])
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .default_size([640.0, 460.0])
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.active_settings_tab, SettingsTab::Providers, "Providers");
-                        ui.selectable_value(&mut self.active_settings_tab, SettingsTab::Models, "Models");
-                        ui.selectable_value(&mut self.active_settings_tab, SettingsTab::General, "General & Defaults");
+                        ui.selectable_value(
+                            &mut self.active_settings_tab,
+                            SettingsTab::Providers,
+                            "Providers",
+                        );
+                        ui.selectable_value(
+                            &mut self.active_settings_tab,
+                            SettingsTab::Models,
+                            "Models",
+                        );
+                        ui.selectable_value(
+                            &mut self.active_settings_tab,
+                            SettingsTab::General,
+                            "General & Defaults",
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✕ Close").clicked() {
+                                close_clicked = true;
+                            }
+                        });
                     });
                     ui.separator();
 
@@ -1687,156 +2034,315 @@ impl eframe::App for ZipChatApp {
                             }
                             ui.add_space(8.0);
 
-                            egui::ScrollArea::vertical().id_salt("settings_providers_scroll").show(ui, |ui| {
-                                let mut to_remove = None;
-                                let mut to_test = None;
-                                for p in &mut self.providers {
-                                    ui.group(|ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.checkbox(&mut p.enabled, "");
-                                            ui.text_edit_singleline(&mut p.name);
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                if ui.small_button("Delete").clicked() {
-                                                    to_remove = Some(p.id.clone());
+                            egui::ScrollArea::vertical()
+                                .id_salt("settings_providers_scroll")
+                                .max_height(300.0)
+                                .show(ui, |ui| {
+                                    let mut to_remove = None;
+                                    let mut to_test = None;
+                                    for p in &mut self.providers {
+                                        ui.group(|ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.checkbox(&mut p.enabled, "");
+                                                let (c, tip) = self.provider_status_dot(&p.id);
+                                                ui.colored_label(c, "●").on_hover_text(tip);
+                                                ui.text_edit_singleline(&mut p.name);
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        if ui.small_button("Delete").clicked() {
+                                                            to_remove = Some(p.id.clone());
+                                                        }
+                                                    },
+                                                );
+                                            });
+
+                                            ui.horizontal(|ui| {
+                                                ui.label("Base URL:");
+                                                if ui.text_edit_singleline(&mut p.base_url).changed()
+                                                {
+                                                    settings_changed = true;
+                                                }
+                                            });
+
+                                            let key_entry =
+                                                self.api_keys.entry(p.id.clone()).or_default();
+                                            ui.horizontal(|ui| {
+                                                ui.label("API Key:");
+                                                if ui
+                                                    .add(
+                                                        egui::TextEdit::singleline(key_entry)
+                                                            .password(true),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    secrets_changed = true;
+                                                }
+                                            });
+
+                                            let is_gateway = p.id == "vercel"
+                                                || p.id == "gateway"
+                                                || p.base_url.contains("ai-gateway.vercel.sh");
+                                            if is_gateway {
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Service Tier:");
+                                                    let current_tier = p
+                                                        .service_tier()
+                                                        .unwrap_or_else(|| "None".to_string());
+                                                    egui::ComboBox::from_id_salt(format!(
+                                                        "service_tier_{}",
+                                                        p.id
+                                                    ))
+                                                    .selected_text(&current_tier)
+                                                    .show_ui(ui, |ui| {
+                                                        if ui
+                                                            .selectable_label(
+                                                                current_tier == "None",
+                                                                "None (Default)",
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            p.set_service_tier(None);
+                                                            settings_changed = true;
+                                                        }
+                                                        if ui
+                                                            .selectable_label(
+                                                                current_tier == "flex",
+                                                                "flex",
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            p.set_service_tier(Some("flex"));
+                                                            settings_changed = true;
+                                                        }
+                                                        if ui
+                                                            .selectable_label(
+                                                                current_tier == "priority",
+                                                                "priority",
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            p.set_service_tier(Some(
+                                                                "priority",
+                                                            ));
+                                                            settings_changed = true;
+                                                        }
+                                                    });
+                                                });
+                                            }
+
+                                            ui.horizontal(|ui| {
+                                                let is_testing = matches!(
+                                                    &self.status,
+                                                    ConnectionStatus::Testing(id) if id == &p.id
+                                                );
+                                                let btn_txt = if is_testing {
+                                                    "Testing..."
+                                                } else {
+                                                    "Test Connection"
+                                                };
+                                                if ui
+                                                    .add_enabled(
+                                                        !is_testing,
+                                                        egui::Button::new(btn_txt),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    to_test = Some(p.id.clone());
+                                                }
+
+                                                if let Some(ts) = p.models_fetched_at {
+                                                    let _ = ts;
+                                                    ui.label(format!(
+                                                        "{} models cached",
+                                                        p.models.len()
+                                                    ));
                                                 }
                                             });
                                         });
-
-                                        ui.horizontal(|ui| {
-                                            ui.label("Base URL:");
-                                            if ui.text_edit_singleline(&mut p.base_url).changed() {
-                                                settings_changed = true;
-                                            }
-                                        });
-
-                                        let key_entry = self.api_keys.entry(p.id.clone()).or_default();
-                                        ui.horizontal(|ui| {
-                                            ui.label("API Key:");
-                                            if ui.add(egui::TextEdit::singleline(key_entry).password(true)).changed() {
-                                                secrets_changed = true;
-                                            }
-                                        });
-
-                                        ui.horizontal(|ui| {
-                                            let is_testing = matches!(&self.status, ConnectionStatus::Testing(id) if id == &p.id);
-                                            let btn_txt = if is_testing { "Testing..." } else { "Test Connection" };
-                                            if ui.add_enabled(!is_testing, egui::Button::new(btn_txt)).clicked() {
-                                                to_test = Some(p.id.clone());
-                                            }
-
-                                            if let Some(ts) = p.models_fetched_at {
-                                                let _ = ts;
-                                                ui.label(format!("{} models cached", p.models.len()));
-                                            }
-                                        });
-                                    });
-                                    ui.add_space(4.0);
-                                }
-                                if let Some(id) = to_remove {
-                                    remove_provider_id = Some(id);
-                                }
-                                if let Some(id) = to_test {
-                                    self.test_provider_connection(&id);
-                                }
-                            });
+                                        ui.add_space(4.0);
+                                    }
+                                    if let Some(id) = to_remove {
+                                        remove_provider_id = Some(id);
+                                    }
+                                    if let Some(id) = to_test {
+                                        self.test_provider_connection(&id);
+                                    }
+                                });
                         }
                         SettingsTab::Models => {
                             ui.heading("Manage Models");
-                            ui.label("Pull, refresh, or manually add models per provider.");
-                            ui.add_space(8.0);
+                            ui.label("Pull, filter, pin, or hide models per provider.");
+                            ui.add_space(6.0);
 
+                            let current_pid = self.active_provider_id.clone();
                             ui.horizontal(|ui| {
                                 ui.label("Provider:");
-                                let active_name = self.current_provider().map(|p| p.name.clone()).unwrap_or_default();
+                                let active_name = self
+                                    .current_provider()
+                                    .map(|p| p.name.clone())
+                                    .unwrap_or_default();
                                 egui::ComboBox::from_id_salt("settings_provider_picker")
                                     .selected_text(active_name)
                                     .show_ui(ui, |ui| {
                                         for p in &self.providers {
-                                            if ui.selectable_label(p.id == self.active_provider_id, &p.name).clicked() {
+                                            if ui
+                                                .selectable_label(
+                                                    p.id == self.active_provider_id,
+                                                    &p.name,
+                                                )
+                                                .clicked()
+                                            {
                                                 self.active_provider_id = p.id.clone();
                                             }
                                         }
                                     });
 
-                                let current_pid = self.active_provider_id.clone();
-                                let is_refreshing = self.refreshing_providers.contains(&current_pid);
-                                if ui.add_enabled(!is_refreshing, egui::Button::new("Refresh Models")).clicked() {
+                                let is_refreshing =
+                                    self.refreshing_providers.contains(&current_pid);
+                                if ui
+                                    .add_enabled(
+                                        !is_refreshing,
+                                        egui::Button::new("Refresh Models"),
+                                    )
+                                    .clicked()
+                                {
                                     self.trigger_background_model_fetch(&current_pid);
+                                }
+
+                                if let Some(p) =
+                                    self.providers.iter().find(|p| p.id == current_pid)
+                                {
+                                    let hidden_count = p
+                                        .models
+                                        .iter()
+                                        .filter(|m| p.is_model_blacklisted(m))
+                                        .count();
+                                    let visible_count = p.models.len().saturating_sub(hidden_count);
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} visible · {} hidden",
+                                            visible_count, hidden_count
+                                        ))
+                                        .weak()
+                                        .size(11.0),
+                                    );
                                 }
                             });
 
-                            ui.add_space(8.0);
+                            ui.add_space(4.0);
                             ui.horizontal(|ui| {
                                 ui.label("Add Model ID:");
                                 ui.text_edit_singleline(&mut self.manual_model_input);
-                                if ui.button("+ Add").clicked() && !self.manual_model_input.trim().is_empty() {
+                                if ui.button("+ Add").clicked()
+                                    && !self.manual_model_input.trim().is_empty()
+                                {
                                     let model_id = self.manual_model_input.clone();
-                                    let pid = self.active_provider_id.clone();
-                                    self.add_manual_model(&pid, &model_id);
+                                    self.add_manual_model(&current_pid, &model_id);
                                 }
                             });
 
+                            let mut bulk_hide_pattern = None;
+                            let mut clear_all_hidden = false;
                             ui.horizontal(|ui| {
-                                ui.label("Hide / Blacklist Pattern:");
+                                ui.label("🔍 Filter:");
                                 ui.text_edit_singleline(&mut self.blacklist_input);
-                                if ui.button("+ Blacklist").clicked() && !self.blacklist_input.trim().is_empty() {
-                                    let pattern = self.blacklist_input.clone();
-                                    let pid = self.active_provider_id.clone();
-                                    self.add_blacklist_model(&pid, &pattern);
+                                let has_filter = !self.blacklist_input.trim().is_empty();
+                                if ui
+                                    .add_enabled(
+                                        has_filter,
+                                        egui::Button::new("Hide Matching"),
+                                    )
+                                    .on_hover_text(
+                                        "Hide all models matching this filter string",
+                                    )
+                                    .clicked()
+                                {
+                                    bulk_hide_pattern = Some(self.blacklist_input.clone());
+                                }
+                                ui.checkbox(&mut self.show_hidden_models, "Show Hidden");
+                                let has_blacklist = self
+                                    .providers
+                                    .iter()
+                                    .find(|p| p.id == current_pid)
+                                    .map(|p| !p.model_blacklist.is_empty())
+                                    .unwrap_or(false);
+                                if ui
+                                    .add_enabled(has_blacklist, egui::Button::new("Unhide All"))
+                                    .clicked()
+                                {
+                                    clear_all_hidden = true;
                                 }
                             });
-
-                            let current_pid = self.active_provider_id.clone();
-                            let mut remove_blacklist_target = None;
-                            if let Some(p) = self.providers.iter().find(|p| p.id == current_pid) {
-                                if !p.model_blacklist.is_empty() {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(egui::RichText::new("Blacklisted patterns:").weak().size(11.0));
-                                        for b in &p.model_blacklist {
-                                            if ui.small_button(format!("✕ {}", b)).on_hover_text("Click to remove from blacklist").clicked() {
-                                                remove_blacklist_target = Some(b.clone());
-                                            }
-                                        }
-                                    });
-                                }
+                            if let Some(pat) = bulk_hide_pattern {
+                                self.add_blacklist_model(&current_pid, &pat);
                             }
-                            if let Some(b) = remove_blacklist_target {
-                                self.remove_blacklist_model(&current_pid, &b);
+                            if clear_all_hidden {
+                                self.clear_blacklist(&current_pid);
                             }
 
                             ui.separator();
-                            ui.label("Available & Cached Models:");
+                            let filter_query = self.blacklist_input.trim().to_lowercase();
                             let mut toggle_pin_target = None;
                             let mut toggle_blacklist_target = None;
                             if let Some(p) = self.providers.iter().find(|p| p.id == current_pid) {
-                                egui::ScrollArea::vertical().id_salt("settings_models_scroll").show(ui, |ui| {
-                                    for m in &p.models {
-                                        let is_blacklisted = p.is_model_blacklisted(m);
-                                        ui.horizontal(|ui| {
-                                            let is_pinned = self.pinned_models.contains(m);
-                                            let pin_icon = if is_pinned { "★ Pinned" } else { "☆ Pin" };
-                                            if ui.small_button(pin_icon).clicked() {
-                                                toggle_pin_target = Some(m.clone());
+                                egui::ScrollArea::vertical()
+                                    .id_salt("settings_models_scroll")
+                                    .max_height(240.0)
+                                    .show(ui, |ui| {
+                                        for m in &p.models {
+                                            if !filter_query.is_empty()
+                                                && !m.to_lowercase().contains(&filter_query)
+                                            {
+                                                continue;
                                             }
-
-                                            let hide_label = if is_blacklisted { "⊘ Hidden" } else { "Hide" };
-                                            if ui.small_button(hide_label).clicked() {
-                                                toggle_blacklist_target = Some((m.clone(), !is_blacklisted));
+                                            let is_blacklisted = p.is_model_blacklisted(m);
+                                            if is_blacklisted && !self.show_hidden_models {
+                                                continue;
                                             }
+                                            ui.horizontal(|ui| {
+                                                let is_pinned = self.pinned_models.contains(m);
+                                                let pin_icon =
+                                                    if is_pinned { "★" } else { "☆" };
+                                                if ui
+                                                    .small_button(pin_icon)
+                                                    .on_hover_text("Pin / Unpin model")
+                                                    .clicked()
+                                                {
+                                                    toggle_pin_target = Some(m.clone());
+                                                }
 
-                                            let text_widget = if is_blacklisted {
-                                                egui::RichText::new(m).strikethrough().weak()
-                                            } else {
-                                                egui::RichText::new(m)
-                                            };
-                                            ui.label(text_widget);
+                                                let mut is_visible = !is_blacklisted;
+                                                if ui
+                                                    .checkbox(&mut is_visible, "")
+                                                    .on_hover_text(
+                                                        "Toggle model visibility in selector",
+                                                    )
+                                                    .changed()
+                                                {
+                                                    toggle_blacklist_target =
+                                                        Some((m.clone(), !is_visible));
+                                                }
 
-                                            if let Some(price) = p.model_pricing.get(m) {
-                                                ui.label(egui::RichText::new(price).weak().size(11.0));
-                                            }
-                                        });
-                                    }
-                                });
+                                                let text_widget = if is_blacklisted {
+                                                    egui::RichText::new(m).strikethrough().weak()
+                                                } else {
+                                                    egui::RichText::new(m)
+                                                };
+                                                ui.label(text_widget);
+
+                                                if let Some(price) = p.model_pricing.get(m) {
+                                                    ui.label(
+                                                        egui::RichText::new(price)
+                                                            .weak()
+                                                            .size(11.0),
+                                                    );
+                                                }
+                                            });
+                                        }
+                                    });
                             }
                             if let Some(m) = toggle_pin_target {
                                 self.toggle_pin_model(&m);
@@ -1891,10 +2397,12 @@ impl eframe::App for ZipChatApp {
                     ui.separator();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Close").clicked() {
-                            self.show_settings_modal = false;
+                            close_clicked = true;
                         }
                     });
                 });
+
+            self.show_settings_modal = modal_open && !close_clicked;
         }
 
         if let Some(id) = remove_provider_id {

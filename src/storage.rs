@@ -82,12 +82,7 @@ impl AppSettingsData {
             "Vercel AI Gateway",
             "https://ai-gateway.vercel.sh/v1",
         );
-        vercel.models = vec!["openai/gpt-4o".to_string()];
-        vercel.provider_options = Some(serde_json::json!({
-            "gateway": {
-                "serviceTier": "flex"
-            }
-        }));
+        vercel.models = vec!["openai/gpt-4o".to_string(), "openai/o3-mini".to_string()];
 
         vec![
             Provider::new("openai", "OpenAI", "https://api.openai.com/v1"),

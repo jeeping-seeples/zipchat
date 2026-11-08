@@ -290,17 +290,8 @@ impl ApiClient {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let (error_type, message) = match response.json::<ApiErrorResponse>().await {
-            Ok(body) => (
-                body.error.error_type.unwrap_or_else(|| "error".to_string()),
-                if body.error.message.is_empty() {
-                    format!("HTTP status {}", status)
-                } else {
-                    body.error.message
-                },
-            ),
-            Err(_) => ("unknown".to_string(), format!("HTTP error {}", status)),
-        };
+        let raw_text = response.text().await.unwrap_or_default();
+        let (error_type, message) = Self::parse_error_body(&raw_text, status);
 
         match status {
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ClientError::AuthError(message),
@@ -314,6 +305,48 @@ impl ApiClient {
                 error_type,
                 message,
             },
+        }
+    }
+
+    fn parse_error_body(raw: &str, status: StatusCode) -> (String, String) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) {
+            if let Some(err_obj) = val.get("error").and_then(|e| e.as_object()) {
+                let msg = err_obj
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let err_type = err_obj
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("error")
+                    .to_string();
+                if !msg.is_empty() {
+                    return (err_type, msg);
+                }
+            }
+            if let Some(err_str) = val.get("error").and_then(|e| e.as_str()) {
+                if !err_str.is_empty() {
+                    return ("error".to_string(), err_str.to_string());
+                }
+            }
+            if let Some(msg_str) = val.get("message").and_then(|m| m.as_str()) {
+                if !msg_str.is_empty() {
+                    return ("error".to_string(), msg_str.to_string());
+                }
+            }
+        }
+
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let snippet = if trimmed.len() > 300 {
+                format!("{}...", &trimmed[..300])
+            } else {
+                trimmed.to_string()
+            };
+            ("error".to_string(), snippet)
+        } else {
+            ("unknown".to_string(), format!("HTTP error {}", status))
         }
     }
 }

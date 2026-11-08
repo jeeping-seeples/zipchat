@@ -135,6 +135,41 @@ async fn test_chat_completion_error_handling() {
 }
 
 #[tokio::test]
+async fn test_chat_completion_string_error_handling() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": "Unsupported service tier for model"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let client = ApiClient::new(format!("{}/v1", mock_server.uri()), None, HashMap::new())
+        .expect("Valid client URL");
+    let req = ChatCompletionRequest {
+        model: "openai/gpt-4o".to_string(),
+        messages: vec![ChatMessage::user("Hi")],
+        temperature: None,
+        max_tokens: None,
+        stream: Some(false),
+        provider_options: None,
+    };
+
+    let res = client.chat_completion(&req).await;
+    match res {
+        Err(ClientError::ProviderError {
+            status, message, ..
+        }) => {
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(message.contains("Unsupported service tier for model"));
+        }
+        _ => panic!("Expected ProviderError(400), got {:?}", res),
+    }
+}
+
+#[tokio::test]
 async fn test_chat_completion_stream_success() {
     let mock_server = MockServer::start().await;
 
