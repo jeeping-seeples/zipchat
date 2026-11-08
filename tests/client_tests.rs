@@ -80,6 +80,7 @@ async fn test_chat_completion_non_streaming() {
         temperature: Some(0.7),
         max_tokens: Some(100),
         stream: Some(false),
+        provider_options: None,
     };
 
     let resp = client
@@ -118,6 +119,7 @@ async fn test_chat_completion_error_handling() {
         temperature: None,
         max_tokens: None,
         stream: Some(false),
+        provider_options: None,
     };
 
     let res = client.chat_completion(&req).await;
@@ -158,6 +160,7 @@ async fn test_chat_completion_stream_success() {
         temperature: None,
         max_tokens: None,
         stream: Some(true),
+        provider_options: None,
     };
 
     let (tx, mut rx) = mpsc::channel(16);
@@ -176,4 +179,126 @@ async fn test_chat_completion_stream_success() {
     }
 
     assert_eq!(collected, "Hello world!");
+}
+
+#[tokio::test]
+async fn test_chat_completion_with_vercel_provider_options() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(json!({
+            "model": "openai/gpt-4o",
+            "providerOptions": {
+                "gateway": {
+                    "serviceTier": "flex"
+                }
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-vercel-1",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "openai/gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Analysis complete."
+                },
+                "finish_reason": "stop"
+            }]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let client = ApiClient::new(format!("{}/v1", mock_server.uri()), None, HashMap::new())
+        .expect("Valid client URL");
+    let req = ChatCompletionRequest {
+        model: "openai/gpt-4o".to_string(),
+        messages: vec![ChatMessage::user("Analyze this log file.")],
+        temperature: None,
+        max_tokens: None,
+        stream: Some(false),
+        provider_options: Some(json!({
+            "gateway": {
+                "serviceTier": "flex"
+            }
+        })),
+    };
+
+    let resp = client
+        .chat_completion(&req)
+        .await
+        .expect("Chat completion with providerOptions succeeded");
+
+    assert_eq!(resp.id.as_deref(), Some("chatcmpl-vercel-1"));
+    assert_eq!(resp.choices[0].message.content, "Analysis complete.");
+}
+
+#[tokio::test]
+async fn test_list_models_with_pricing_parsing() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": "openai/gpt-4o",
+                    "pricing": {
+                        "prompt": "0.0000025",
+                        "completion": "0.00001"
+                    }
+                },
+                {
+                    "id": "deepseek/deepseek-chat",
+                    "pricing": {
+                        "input": 0.00000014,
+                        "output": 0.00000028
+                    }
+                },
+                {
+                    "id": "free/model",
+                    "pricing": {
+                        "prompt": "0",
+                        "completion": "0"
+                    }
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let client = ApiClient::new(format!("{}/v1", mock_server.uri()), None, HashMap::new())
+        .expect("Valid client URL");
+
+    let model_list = client.list_models().await.expect("List models succeeded");
+    assert_eq!(model_list.data.len(), 3);
+
+    let gpt4o = &model_list.data[0];
+    assert_eq!(gpt4o.id, "openai/gpt-4o");
+    let summary = gpt4o
+        .pricing
+        .as_ref()
+        .and_then(|p| p.display_summary())
+        .expect("Pricing summary present");
+    assert_eq!(summary, "in: $2.50/M · out: $10.00/M");
+
+    let deepseek = &model_list.data[1];
+    let ds_summary = deepseek
+        .pricing
+        .as_ref()
+        .and_then(|p| p.display_summary())
+        .expect("Deepseek pricing present");
+    assert_eq!(ds_summary, "in: $0.14/M · out: $0.28/M");
+
+    let free = &model_list.data[2];
+    let free_summary = free
+        .pricing
+        .as_ref()
+        .and_then(|p| p.display_summary())
+        .expect("Free pricing present");
+    assert_eq!(free_summary, "in: Free · out: Free");
 }

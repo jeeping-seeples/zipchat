@@ -233,3 +233,41 @@ async fn test_app_state_provider_and_model_management() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_default_presets_include_vercel() {
+    let presets = AppSettingsData::default_presets();
+    let vercel = presets
+        .iter()
+        .find(|p| p.id == "vercel")
+        .expect("Vercel preset exists");
+
+    assert_eq!(vercel.name, "Vercel AI Gateway");
+    assert_eq!(vercel.base_url, "https://ai-gateway.vercel.sh/v1");
+    assert!(vercel.models.contains(&"openai/gpt-4o".to_string()));
+    assert_eq!(
+        vercel.provider_options,
+        Some(serde_json::json!({
+            "gateway": {
+                "serviceTier": "flex"
+            }
+        }))
+    );
+}
+
+#[test]
+fn test_provider_model_blacklist_filtering() {
+    let mut provider = Provider::new("openrouter", "OpenRouter", "https://openrouter.ai/api/v1");
+    provider.models = vec![
+        "openai/gpt-4o".to_string(),
+        "openai/whisper-large".to_string(),
+        "meta-llama/llama-3".to_string(),
+        "text-embedding-3-small".to_string(),
+    ];
+    provider.model_blacklist = vec!["whisper".to_string(), "text-embedding".to_string()];
+
+    assert!(!provider.is_model_blacklisted("openai/gpt-4o"));
+    assert!(!provider.is_model_blacklisted("meta-llama/llama-3"));
+    assert!(provider.is_model_blacklisted("openai/whisper-large"));
+    assert!(provider.is_model_blacklisted("text-embedding-3-small"));
+}

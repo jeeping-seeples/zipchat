@@ -75,6 +75,7 @@ pub struct ZipChatApp {
     pub active_settings_tab: SettingsTab,
     pub model_search_query: String,
     pub manual_model_input: String,
+    pub blacklist_input: String,
     pub refreshing_providers: HashSet<String>,
     pub provider_refresh_errors: HashMap<String, String>,
     pub conversations: Vec<Conversation>,
@@ -133,6 +134,7 @@ impl ZipChatApp {
             active_settings_tab: SettingsTab::Providers,
             model_search_query: String::new(),
             manual_model_input: String::new(),
+            blacklist_input: String::new(),
             refreshing_providers: HashSet::new(),
             provider_refresh_errors: HashMap::new(),
             conversations: loaded_convs,
@@ -293,6 +295,28 @@ impl ZipChatApp {
             }
         }
         self.manual_model_input.clear();
+    }
+
+    pub fn add_blacklist_model(&mut self, provider_id: &str, pattern: &str) {
+        let trimmed = pattern.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        if let Some(p) = self.providers.iter_mut().find(|p| p.id == provider_id) {
+            if !p.model_blacklist.contains(&trimmed.to_string()) {
+                p.model_blacklist.push(trimmed.to_string());
+                self.persist_settings();
+            }
+        }
+        self.blacklist_input.clear();
+    }
+
+    pub fn remove_blacklist_model(&mut self, provider_id: &str, pattern: &str) {
+        if let Some(p) = self.providers.iter_mut().find(|p| p.id == provider_id) {
+            p.model_blacklist.retain(|b| b != pattern);
+            self.persist_settings();
+        }
     }
 
     pub fn toggle_pin_model(&mut self, model: &str) {
@@ -754,12 +778,28 @@ impl ZipChatApp {
                 }
             };
 
+            let provider_options = provider
+                .as_ref()
+                .and_then(|p| p.provider_options.clone())
+                .or_else(|| {
+                    if provider_id == "vercel" || base_url.contains("ai-gateway.vercel.sh") {
+                        Some(serde_json::json!({
+                            "gateway": {
+                                "serviceTier": "flex"
+                            }
+                        }))
+                    } else {
+                        None
+                    }
+                });
+
             let req = ChatCompletionRequest {
                 model,
                 messages,
                 temperature,
                 max_tokens,
                 stream: Some(stream),
+                provider_options,
             };
 
             if stream {
@@ -855,7 +895,13 @@ impl ZipChatApp {
                     Ok(model_list) => {
                         let count = model_list.data.len();
                         if let Some(p) = self.providers.iter_mut().find(|p| p.id == provider_id) {
-                            p.models = model_list.data.into_iter().map(|m| m.id).collect();
+                            p.models = model_list.data.iter().map(|m| m.id.clone()).collect();
+                            p.model_pricing.clear();
+                            for m in &model_list.data {
+                                if let Some(summary) = m.pricing.as_ref().and_then(|pr| pr.display_summary()) {
+                                    p.model_pricing.insert(m.id.clone(), summary);
+                                }
+                            }
                             p.models_fetched_at = Some(
                                 SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
@@ -885,7 +931,13 @@ impl ZipChatApp {
                         Ok(model_list) => {
                             if let Some(p) = self.providers.iter_mut().find(|p| p.id == provider_id)
                             {
-                                p.models = model_list.data.into_iter().map(|m| m.id).collect();
+                                p.models = model_list.data.iter().map(|m| m.id.clone()).collect();
+                                p.model_pricing.clear();
+                                for m in &model_list.data {
+                                    if let Some(summary) = m.pricing.as_ref().and_then(|pr| pr.display_summary()) {
+                                        p.model_pricing.insert(m.id.clone(), summary);
+                                    }
+                                }
                                 p.models_fetched_at = Some(
                                     SystemTime::now()
                                         .duration_since(UNIX_EPOCH)
@@ -1243,11 +1295,21 @@ impl eframe::App for ZipChatApp {
                         ui.separator();
 
                         let query = self.model_search_query.to_lowercase();
+                        let active_provider_opt = self.providers.iter().find(|p| p.id == active_pid);
 
                         if !self.pinned_models.is_empty() {
-                            ui.label(egui::RichText::new("★ Pinned").strong().size(11.0));
+                            let mut pinned_header_drawn = false;
                             for pinned in &self.pinned_models {
+                                if let Some(p) = active_provider_opt {
+                                    if p.is_model_blacklisted(pinned) {
+                                        continue;
+                                    }
+                                }
                                 if query.is_empty() || pinned.to_lowercase().contains(&query) {
+                                    if !pinned_header_drawn {
+                                        ui.label(egui::RichText::new("★ Pinned").strong().size(11.0));
+                                        pinned_header_drawn = true;
+                                    }
                                     ui.horizontal(|ui| {
                                         if ui.small_button("★").clicked() {
                                             toggle_pin = Some(pinned.clone());
@@ -1256,10 +1318,17 @@ impl eframe::App for ZipChatApp {
                                         if ui.selectable_label(is_selected, pinned).clicked() {
                                             new_selected_model = Some(pinned.clone());
                                         }
+                                        if let Some(p) = active_provider_opt {
+                                            if let Some(price) = p.model_pricing.get(pinned) {
+                                                ui.label(egui::RichText::new(price).weak().size(10.0));
+                                            }
+                                        }
                                     });
                                 }
                             }
-                            ui.separator();
+                            if pinned_header_drawn {
+                                ui.separator();
+                            }
                         }
 
                         for provider in &self.providers {
@@ -1270,6 +1339,7 @@ impl eframe::App for ZipChatApp {
                             let matching_models: Vec<&String> = provider
                                 .models
                                 .iter()
+                                .filter(|m| !provider.is_model_blacklisted(m))
                                 .filter(|m| query.is_empty() || m.to_lowercase().contains(&query))
                                 .collect();
 
@@ -1285,6 +1355,9 @@ impl eframe::App for ZipChatApp {
                                         let is_selected = current_model_str == **m;
                                         if ui.selectable_label(is_selected, m).clicked() {
                                             new_selected_model = Some(m.clone());
+                                        }
+                                        if let Some(price) = provider.model_pricing.get(m) {
+                                            ui.label(egui::RichText::new(price).weak().size(10.0));
                                         }
                                     });
                                 }
@@ -1694,26 +1767,77 @@ impl eframe::App for ZipChatApp {
                                 }
                             });
 
+                            ui.horizontal(|ui| {
+                                ui.label("Hide / Blacklist Pattern:");
+                                ui.text_edit_singleline(&mut self.blacklist_input);
+                                if ui.button("+ Blacklist").clicked() && !self.blacklist_input.trim().is_empty() {
+                                    let pattern = self.blacklist_input.clone();
+                                    let pid = self.active_provider_id.clone();
+                                    self.add_blacklist_model(&pid, &pattern);
+                                }
+                            });
+
+                            let current_pid = self.active_provider_id.clone();
+                            let mut remove_blacklist_target = None;
+                            if let Some(p) = self.providers.iter().find(|p| p.id == current_pid) {
+                                if !p.model_blacklist.is_empty() {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(egui::RichText::new("Blacklisted patterns:").weak().size(11.0));
+                                        for b in &p.model_blacklist {
+                                            if ui.small_button(format!("✕ {}", b)).on_hover_text("Click to remove from blacklist").clicked() {
+                                                remove_blacklist_target = Some(b.clone());
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                            if let Some(b) = remove_blacklist_target {
+                                self.remove_blacklist_model(&current_pid, &b);
+                            }
+
                             ui.separator();
                             ui.label("Available & Cached Models:");
-                            let current_pid = self.active_provider_id.clone();
                             let mut toggle_pin_target = None;
+                            let mut toggle_blacklist_target = None;
                             if let Some(p) = self.providers.iter().find(|p| p.id == current_pid) {
                                 egui::ScrollArea::vertical().id_salt("settings_models_scroll").show(ui, |ui| {
                                     for m in &p.models {
+                                        let is_blacklisted = p.is_model_blacklisted(m);
                                         ui.horizontal(|ui| {
                                             let is_pinned = self.pinned_models.contains(m);
                                             let pin_icon = if is_pinned { "★ Pinned" } else { "☆ Pin" };
                                             if ui.small_button(pin_icon).clicked() {
                                                 toggle_pin_target = Some(m.clone());
                                             }
-                                            ui.label(m);
+
+                                            let hide_label = if is_blacklisted { "⊘ Hidden" } else { "Hide" };
+                                            if ui.small_button(hide_label).clicked() {
+                                                toggle_blacklist_target = Some((m.clone(), !is_blacklisted));
+                                            }
+
+                                            let text_widget = if is_blacklisted {
+                                                egui::RichText::new(m).strikethrough().weak()
+                                            } else {
+                                                egui::RichText::new(m)
+                                            };
+                                            ui.label(text_widget);
+
+                                            if let Some(price) = p.model_pricing.get(m) {
+                                                ui.label(egui::RichText::new(price).weak().size(11.0));
+                                            }
                                         });
                                     }
                                 });
                             }
                             if let Some(m) = toggle_pin_target {
                                 self.toggle_pin_model(&m);
+                            }
+                            if let Some((pattern, should_add)) = toggle_blacklist_target {
+                                if should_add {
+                                    self.add_blacklist_model(&current_pid, &pattern);
+                                } else {
+                                    self.remove_blacklist_model(&current_pid, &pattern);
+                                }
                             }
                         }
                         SettingsTab::General => {

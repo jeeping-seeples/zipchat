@@ -27,7 +27,28 @@
       "base_url": "https://openrouter.ai/api/v1",
       "enabled": true,
       "models": [],
-      "models_fetched_at": null
+      "models_fetched_at": null,
+      "model_pricing": {
+        "openai/gpt-4o": "in: $2.50/M · out: $10.00/M"
+      },
+      "model_blacklist": ["whisper", "embed"]
+    },
+    {
+      "id": "vercel",
+      "name": "Vercel AI Gateway",
+      "base_url": "https://ai-gateway.vercel.sh/v1",
+      "enabled": true,
+      "models": [
+        "openai/gpt-4o"
+      ],
+      "models_fetched_at": null,
+      "providerOptions": {
+        "gateway": {
+          "serviceTier": "flex"
+        }
+      },
+      "model_pricing": {},
+      "model_blacklist": []
     },
     {
       "id": "ollama",

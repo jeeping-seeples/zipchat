@@ -77,9 +77,22 @@ impl AppSettingsData {
             .headers
             .insert("X-Title".to_string(), "ZipChat".to_string());
 
+        let mut vercel = Provider::new(
+            "vercel",
+            "Vercel AI Gateway",
+            "https://ai-gateway.vercel.sh/v1",
+        );
+        vercel.models = vec!["openai/gpt-4o".to_string()];
+        vercel.provider_options = Some(serde_json::json!({
+            "gateway": {
+                "serviceTier": "flex"
+            }
+        }));
+
         vec![
             Provider::new("openai", "OpenAI", "https://api.openai.com/v1"),
             openrouter,
+            vercel,
             Provider::new("groq", "Groq", "https://api.groq.com/openai/v1"),
             Provider::new("cerebras", "Cerebras", "https://api.cerebras.ai/v1"),
             Provider::new("together", "Together AI", "https://api.together.xyz/v1"),

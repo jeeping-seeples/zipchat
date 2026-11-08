@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Provider descriptor configured in settings
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Provider {
     pub id: String,
     pub name: String,
@@ -14,6 +14,12 @@ pub struct Provider {
     pub models_fetched_at: Option<u64>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_options: Option<serde_json::Value>,
+    #[serde(default)]
+    pub model_pricing: HashMap<String, String>,
+    #[serde(default)]
+    pub model_blacklist: Vec<String>,
 }
 
 impl Provider {
@@ -30,13 +36,92 @@ impl Provider {
             models: Vec::new(),
             models_fetched_at: None,
             headers: HashMap::new(),
+            provider_options: None,
+            model_pricing: HashMap::new(),
+            model_blacklist: Vec::new(),
+        }
+    }
+
+    pub fn is_model_blacklisted(&self, model: &str) -> bool {
+        let m_lower = model.to_lowercase();
+        self.model_blacklist.iter().any(|b| {
+            let b_lower = b.trim().to_lowercase();
+            !b_lower.is_empty() && (m_lower == b_lower || m_lower.contains(&b_lower))
+        })
+    }
+}
+
+/// Flexible pricing metadata parsed from GET {base}/models
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ModelPricing {
+    #[serde(default)]
+    pub prompt: Option<serde_json::Value>,
+    #[serde(default)]
+    pub completion: Option<serde_json::Value>,
+    #[serde(default)]
+    pub input: Option<serde_json::Value>,
+    #[serde(default)]
+    pub output: Option<serde_json::Value>,
+    #[serde(default)]
+    pub input_cost_per_token: Option<serde_json::Value>,
+    #[serde(default)]
+    pub output_cost_per_token: Option<serde_json::Value>,
+}
+
+impl ModelPricing {
+    pub fn display_summary(&self) -> Option<String> {
+        let p_in = self
+            .prompt
+            .as_ref()
+            .or(self.input.as_ref())
+            .or(self.input_cost_per_token.as_ref());
+        let p_out = self
+            .completion
+            .as_ref()
+            .or(self.output.as_ref())
+            .or(self.output_cost_per_token.as_ref());
+
+        if p_in.is_none() && p_out.is_none() {
+            return None;
+        }
+
+        let fmt_val = |v: &serde_json::Value| -> Option<String> {
+            let num: Option<f64> = if let Some(n) = v.as_f64() {
+                Some(n)
+            } else if let Some(s) = v.as_str() {
+                s.parse::<f64>().ok()
+            } else {
+                None
+            };
+
+            num.map(|val| {
+                if val == 0.0 {
+                    "Free".to_string()
+                } else if val > 0.0 && val < 0.001 {
+                    let per_m = val * 1_000_000.0;
+                    if per_m >= 0.01 {
+                        format!("${:.2}/M", per_m)
+                    } else {
+                        format!("${:.4}/M", per_m)
+                    }
+                } else {
+                    format!("${:.4}", val)
+                }
+            })
+        };
+
+        match (p_in.and_then(fmt_val), p_out.and_then(fmt_val)) {
+            (Some(i), Some(o)) => Some(format!("in: {} · out: {}", i, o)),
+            (Some(i), None) => Some(format!("in: {}", i)),
+            (None, Some(o)) => Some(format!("out: {}", o)),
+            (None, None) => None,
         }
     }
 }
 
 /// Model descriptor in GET {base}/models response
 /// Tolerant parsing: only `id` is required
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelCard {
     pub id: String,
     #[serde(default)]
@@ -45,10 +130,12 @@ pub struct ModelCard {
     pub created: Option<u64>,
     #[serde(default)]
     pub owned_by: Option<String>,
+    #[serde(default)]
+    pub pricing: Option<ModelPricing>,
 }
 
 /// Response from GET {base}/models
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelListResponse {
     #[serde(default)]
     pub object: Option<String>,
@@ -102,6 +189,8 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    #[serde(rename = "providerOptions", skip_serializing_if = "Option::is_none", default)]
+    pub provider_options: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
