@@ -271,11 +271,11 @@ async fn test_conversation_rename_and_activity_order() {
     let _ = fs::remove_dir_all(&temp_dir);
 
     let storage = StorageManager::new(Some(temp_dir.clone()));
-    let mut app = zipchat::app::ZipChatApp::new_test(storage);
+    let mut app = zipchat::app::ZipChatApp::with_storage(storage);
 
-    app.create_conversation();
+    assert_eq!(app.conversations.len(), 1);
     let conv1_id = app.conversations[0].id.clone();
-    assert_eq!(app.conversations[0].title, "Chat 1");
+    assert_eq!(app.conversations[0].title, "New Chat");
 
     app.rename_conversation(&conv1_id, "Project Discussion");
     assert_eq!(app.conversations[0].title, "Project Discussion");
@@ -284,6 +284,7 @@ async fn test_conversation_rename_and_activity_order() {
     app.create_conversation();
     assert_eq!(app.conversations.len(), 2);
     let conv2_id = app.conversations[1].id.clone();
+    assert_eq!(app.conversations[1].title, "Chat 2");
 
     // Verify ordering by last_activity_secs
     let activity1 = app.conversations[0].last_activity_secs();
@@ -302,7 +303,7 @@ async fn test_provider_status_dot() {
     let _ = fs::remove_dir_all(&temp_dir);
 
     let storage = StorageManager::new(Some(temp_dir.clone()));
-    let mut app = zipchat::app::ZipChatApp::new_test(storage);
+    let mut app = zipchat::app::ZipChatApp::with_storage(storage);
 
     // Initial state: untracked/ready
     let (_, tip) = app.provider_status_dot("openai");
